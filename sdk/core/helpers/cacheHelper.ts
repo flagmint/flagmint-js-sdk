@@ -42,6 +42,13 @@ function getRulesKey(apiKey: string): string {
   return `flagmint_${apiKey}_rules`;
 }
 
+/**
+ * Parse a rules localCache JSON blob.
+ * Keeps optional PII wire fields so offline hydrate can still hash context.
+ *
+ * @param raw JSON string from storage
+ * @returns Snapshot or null when the payload is unusable
+ */
 function parseRulesSnapshot(raw: string): RulesCacheSnapshot | null {
   try {
     const parsed = JSON.parse(raw) as RulesCacheSnapshot;
@@ -55,12 +62,27 @@ function parseRulesSnapshot(raw: string): RulesCacheSnapshot | null {
     ) {
       return null;
     }
-    return {
+    const snapshot: RulesCacheSnapshot = {
       version: parsed.version,
       expiresAt: parsed.expiresAt,
       flags: parsed.flags,
       segments: parsed.segments || {},
     };
+    if (Array.isArray(parsed.piiAttributes)) {
+      snapshot.piiAttributes = parsed.piiAttributes.filter(
+        (attr): attr is string => typeof attr === 'string',
+      );
+    }
+    if (typeof parsed.piiSalt === 'string') {
+      snapshot.piiSalt = parsed.piiSalt;
+    }
+    if (typeof parsed.piiValueEncoding === 'string') {
+      snapshot.piiValueEncoding = parsed.piiValueEncoding;
+    }
+    if (parsed.piiWireBroken === true) {
+      snapshot.piiWireBroken = true;
+    }
+    return snapshot;
   } catch {
     return null;
   }
@@ -83,6 +105,20 @@ export function loadCachedFlags<T>(apiKey: string, ttl: number): FeatureFlags<T>
 export function saveCachedFlags<T>(apiKey: string, data: FeatureFlags<T>) {
   try {
     storage.setItem(getFlagsKey(apiKey), JSON.stringify({ ts: Date.now(), data }));
+  } catch {
+    // silent fail
+  }
+}
+
+/**
+ * Drop the evaluated-flag localCache entry for an API key.
+ * Used when config-sync is on so a prior tab’s answers cannot poison another tab.
+ *
+ * @param apiKey SDK API key used as the storage key suffix
+ */
+export function clearCachedFlags(apiKey: string) {
+  try {
+    storage.removeItem?.(getFlagsKey(apiKey));
   } catch {
     // silent fail
   }

@@ -134,8 +134,8 @@ After `ready()`:
 | `context` | object | `{}` | Initial evaluation context. Do not put secrets or PII here — the stream URL serializes this object in the query string |
 | `transportMode` | `'auto' \| 'sse' \| 'long-polling'` | `'auto'` | `auto` tries SSE, then long-polling |
 | `EventSourceImpl` | EventSource | browser global | Required in Node |
-| `shareConnection` | boolean | `true` in browsers with `BroadcastChannel`, `false` in Node | One stream per API key across same-origin documents. With `configSync`, shares **rules** only (per-tab local eval). |
-| `enableOfflineCache` | boolean | `true` | Load/save flags via the cache adapter |
+| `shareConnection` | boolean | `true` in browsers with `BroadcastChannel`, `false` in Node | One stream per API key across same-origin documents. With `configSync`, shares **rules** only (per-tab local eval).|
+| `enableOfflineCache` | boolean | `true` | Server-eval: load/save evaluated flags. Config-sync: load/save **rules** only (evaluated maps are not cached — they are per-user and would collide across tabs). |
 | `persistContext` | boolean | `false` | Persist context in the cache adapter |
 | `cacheAdapter` | CacheAdapter | localStorage helpers | Custom cache (Redis, files, …) |
 | `restEndpoint` | string | env default | Override the long-polling / evaluate URL |
