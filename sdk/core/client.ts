@@ -205,6 +205,10 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
   private rulesStore: RulesStore | null = null;
   /** Avoid stacking reconnects when many getFlag calls hit an expired lease. */
   private leaseRenewInFlight = false;
+  /** Leader (and solo) timer to reconnect near config-sync `expiresAt`. */
+  private leaseRenewTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Reconnect slightly before expiresAt to limit fail-closed gaps / clock skew. */
+  private static readonly LEASE_RENEW_SKEW_MS = 5_000;
 
   /**
    * Creates a new FlagClient instance.
@@ -438,13 +442,24 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
   }
 
   /**
-   * Leader: wire context RPC for evaluated share only.
-   * Rules share never forwards follower context onto the stream.
+   * Leader: rules mode listens for follower lease-renew requests; evaluated
+   * mode wires context RPC onto the shared stream.
    */
   private attachShareLeader(): void {
-    if (!this.shareHub || this.shareHub.shareMode === 'rules') {
+    if (!this.shareHub) return;
+
+    if (this.shareHub.shareMode === 'rules') {
+      this.shareHub.setLeaderLeaseRenewHandler(() => {
+        if (!this.transport?.requestReconnect) return;
+        logger.log(
+          '[FlagClient] Rules-share follower requested config-sync lease renew — reconnecting.',
+        );
+        this.leaseRenewInFlight = true;
+        this.transport.requestReconnect('lease_renew_requested');
+      });
       return;
     }
+
     this.shareHub.setLeaderContextHandler(async (context, options) => {
       const mergedContext = toJsonCloneable({ ...this.context, ...context } as C);
       if (options?.persist === true) {
@@ -463,6 +478,37 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
   }
 
   /**
+   * Schedule SSE reconnect near lease `expiresAt` so an idle leader still renews
+   * (followers have no stream of their own under rules share).
+   *
+   * @param expiresAt Lease end from the last verified config-sync payload
+   */
+  private scheduleConfigSyncLeaseRenew(expiresAt: number): void {
+    if (this.leaseRenewTimer) {
+      clearTimeout(this.leaseRenewTimer);
+      this.leaseRenewTimer = null;
+    }
+    // Followers ask the leader via requestReconnect on the share transport.
+    if (this.shareHub?.currentRole === 'follower') return;
+    if (!Number.isFinite(expiresAt) || expiresAt <= 0) return;
+
+    const delayMs = Math.max(
+      0,
+      expiresAt - Date.now() - FlagClient.LEASE_RENEW_SKEW_MS,
+    );
+    this.leaseRenewTimer = setTimeout(() => {
+      this.leaseRenewTimer = null;
+      if (!this.transport?.requestReconnect) return;
+      if (this.leaseRenewInFlight) return;
+      this.leaseRenewInFlight = true;
+      logger.log(
+        '[FlagClient] Config-sync lease window ending — reconnecting for renew.',
+      );
+      this.transport.requestReconnect('lease_expired');
+    }, delayMs);
+  }
+
+  /**
    * Follower hooks for rules-only share: hydrate rules locally and evaluate
    * with this document's context (never the leader's).
    */
@@ -471,6 +517,7 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
 
     this.shareHub.setFollowerRulesApply((payload) => {
       this.rulesStore!.hydrateFromSnapshot(payload.snapshot);
+      this.leaseRenewInFlight = false;
       if (payload.analytics) {
         this.updateAnalytics(payload.analytics);
       }
@@ -894,6 +941,10 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
     if (this.refreshIntervalId) {
       clearInterval(this.refreshIntervalId);
     }
+    if (this.leaseRenewTimer) {
+      clearTimeout(this.leaseRenewTimer);
+      this.leaseRenewTimer = null;
+    }
     if (this.evaluationReportTimer) {
       clearTimeout(this.evaluationReportTimer);
       this.evaluationReportTimer = null;
@@ -1249,6 +1300,7 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
     if (result.ok && (eventName === 'lease' || eventName === 'fullConfig')) {
       this.leaseRenewInFlight = false;
     }
+    this.scheduleConfigSyncLeaseRenew(store.getState().expiresAt);
     // Cold start: lease alone with empty rules — wait for fullConfig/deltas.
     if (
       eventName === 'lease' &&

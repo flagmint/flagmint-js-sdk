@@ -130,6 +130,25 @@ describe('ConnectionShareHub', () => {
     follower.destroy();
   });
 
+  it('rules mode follower requestReconnect asks the leader to renew the lease', async () => {
+    const options = { ...shareOptions(), mode: 'rules' as const };
+    const leader = new ConnectionShareHub('ff_rules_renew', options);
+    const follower = new ConnectionShareHub('ff_rules_renew', options);
+
+    await leader.join();
+    const renew = jest.fn();
+    leader.setLeaderLeaseRenewHandler(renew);
+
+    await follower.join();
+    const transport = follower.createFollowerTransport();
+    transport.requestReconnect?.('lease_expired');
+
+    expect(renew).toHaveBeenCalledTimes(1);
+
+    leader.destroy();
+    follower.destroy();
+  });
+
   it('rules mode shares snapshots without forwarding follower context', async () => {
     const options = { ...shareOptions(), mode: 'rules' as const };
     const leader = new ConnectionShareHub('ff_rules', options);

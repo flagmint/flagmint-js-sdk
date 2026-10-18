@@ -67,6 +67,8 @@ type ShareMessage<C = unknown, T = unknown> =
   | { type: 'error'; memberId: string; message: string; code?: string; retryAfter?: number }
   | { type: 'context-request'; memberId: string; requestId: string; context: C; persist?: boolean }
   | { type: 'context-result'; requestId: string; flags?: Record<string, T>; error?: { message: string; code?: string } }
+  /** Rules follower: ask the leader to reconnect for a fresh lease / fullConfig. */
+  | { type: 'lease-renew-request'; memberId: string }
   | { type: 'bye'; memberId: string };
 
 /**
@@ -183,6 +185,8 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
   }) => Record<string, T>;
   /** Rules mode: re-evaluate after local `updateContext` (no leader RPC). */
   private followerLocalEval?: (context: C) => Record<string, T>;
+  /** Rules mode: leader reconnects SSE when a follower reports lease expiry. */
+  private leaderLeaseRenewHandler?: () => void;
   private followerFlagsCallback?: (flags: Record<string, T>) => void;
   private followerErrorCallback?: (error: Error) => void;
   private readonly now: () => number;
@@ -307,6 +311,28 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
   }
 
   /**
+   * Rules-mode leader: run when a follower asks for lease renew (SSE reconnect).
+   *
+   * @param handler Typically `transport.requestReconnect('lease_renew_requested')`
+   */
+  setLeaderLeaseRenewHandler(handler: () => void): void {
+    this.leaderLeaseRenewHandler = handler;
+  }
+
+  /**
+   * Ask the share leader to renew the config-sync lease (reconnect SSE).
+   * Leaders invoke the handler locally; followers post `lease-renew-request`.
+   */
+  requestLeaseRenew(): void {
+    if (this.mode !== 'rules') return;
+    if (this.role === 'leader') {
+      this.leaderLeaseRenewHandler?.();
+      return;
+    }
+    this.post({ type: 'lease-renew-request', memberId: this.memberId });
+  }
+
+  /**
    * Leader-only: publish the current evaluated flags to all followers.
    * No-op on followers (avoids echo loops). Evaluated mode only.
    *
@@ -372,6 +398,14 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
             throw new Error('Rules-share follower has no local eval handler.');
           }
           return this.followerLocalEval(context);
+        },
+        /**
+         * Follower has no SSE — ask the leader to reconnect for a fresh lease.
+         *
+         * @param _reason Ignored; leader always reconnects for renew
+         */
+        requestReconnect: (_reason?: string) => {
+          this.requestLeaseRenew();
         },
         destroy: () => undefined,
         onFlagsUpdated: (callback) => {
@@ -578,6 +612,10 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
           Object.assign(err, { code: message.code, retryAfter: message.retryAfter });
           this.followerErrorCallback?.(err);
         }
+        break;
+      case 'lease-renew-request':
+        if (this.mode !== 'rules' || this.role !== 'leader') return;
+        this.leaderLeaseRenewHandler?.();
         break;
       case 'context-request':
         // Rules mode never forwards follower context onto the shared stream.
