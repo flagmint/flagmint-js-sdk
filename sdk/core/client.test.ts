@@ -892,6 +892,117 @@ describe('FlagClient', () => {
     client.destroy();
   });
 
+  it('configSync share uses rules mode so follower context stays independent', async () => {
+    MemoryChannel.reset();
+    const share = shareHooks();
+    const apiKey = 'ff_config_sync_rules_share';
+    const snapshot = {
+      version: 3,
+      expiresAt: Date.now() + 60_000,
+      flags: [
+        {
+          key: 'wsd_internal_tester',
+          type: 'boolean' as const,
+          is_active: true,
+          default_value: false,
+          targeting_rules: [
+            {
+              id: 'r1',
+              kind: 'custom',
+              order_index: 0,
+              logical_op: 'AND',
+              conditions: [
+                {
+                  attribute: 'email',
+                  operator: 'eq',
+                  value: 'agent1@example.com',
+                },
+              ],
+              variation_id: 'on',
+            },
+          ],
+          variations: [
+            { id: 'on', value: true },
+            { id: 'off', value: false },
+          ],
+          rollouts: {},
+          analytics_enabled: false,
+        },
+      ],
+      segments: {},
+    };
+    const noCache = {
+      loadFlags: () => null,
+      saveFlags: () => undefined,
+      loadContext: () => null,
+      saveContext: () => undefined,
+      loadRulesSnapshot: () => null,
+      saveRulesSnapshot: () => undefined,
+    };
+
+    const leader = new FlagClient({
+      apiKey,
+      context: { email: 'agent1@example.com' },
+      enableFlagmint: true,
+      deferInitialization: true,
+      configSync: true,
+      shareConnection: true,
+      share,
+      enableOfflineCache: false,
+      cacheAdapter: noCache,
+      transport: createMockTransport(),
+    });
+    await leader.ready();
+
+    const leaderPriv = leader as unknown as {
+      shareHub: {
+        currentRole: string;
+        shareMode: string;
+        broadcastRules: (s: typeof snapshot) => void;
+      };
+      rulesStore: { hydrateFromSnapshot: (s: typeof snapshot) => void };
+      evaluateFromRulesStore: () => Record<string, unknown>;
+      updateFlags: (f: Record<string, unknown>, fromShare?: boolean) => void;
+    };
+    expect(leaderPriv.shareHub.currentRole).toBe('leader');
+    expect(leaderPriv.shareHub.shareMode).toBe('rules');
+    leaderPriv.rulesStore.hydrateFromSnapshot(snapshot);
+    leaderPriv.updateFlags(leaderPriv.evaluateFromRulesStore());
+    expect(leader.getFlag('wsd_internal_tester', false)).toBe(true);
+
+    const follower = new FlagClient({
+      apiKey,
+      context: { email: 'agent19@example.com' },
+      enableFlagmint: true,
+      deferInitialization: true,
+      configSync: true,
+      shareConnection: true,
+      share,
+      enableOfflineCache: false,
+      cacheAdapter: noCache,
+    });
+    await follower.ready();
+
+    const followerPriv = follower as unknown as {
+      shareHub: { currentRole: string; shareMode: string };
+    };
+    expect(followerPriv.shareHub.currentRole).toBe('follower');
+    expect(followerPriv.shareHub.shareMode).toBe('rules');
+    expect(follower.getFlag('wsd_internal_tester', false)).toBe(false);
+
+    await follower.updateContext({ email: 'agent1@example.com' });
+    expect(follower.getFlag('wsd_internal_tester', false)).toBe(true);
+    expect(leader.getFlag('wsd_internal_tester', false)).toBe(true);
+
+    await follower.updateContext({ email: 'agent19@example.com' });
+    expect(follower.getFlag('wsd_internal_tester', false)).toBe(false);
+    expect(leader.getFlag('wsd_internal_tester', false)).toBe(true);
+
+    follower.destroy();
+    leader.destroy();
+    MemoryChannel.reset();
+  });
+
   describe('shared leader and follower persistContext', () => {
     beforeEach(() => {
       MemoryChannel.reset();

@@ -47,7 +47,8 @@ export interface FlagClientOptions<C extends Record<string, any> = Record<string
    * Performs X25519 ECDH on ASL handshake and derives a session MAC key used
    * to verify signed `lease` / `fullConfig` / `delta` payloads.
    * Default false — keeps the legacy evaluated-flags stream.
-   * When true, `shareConnection` defaults to false (rules are not shared across tabs yet).
+   * When true and `shareConnection` is on, tabs share **rules** only (one SSE);
+   * each document keeps its own context and evaluates locally.
    */
   configSync?: boolean;
   /**
@@ -99,6 +100,8 @@ export interface FlagClientOptions<C extends Record<string, any> = Record<string
    * leader and forward updateContext() to it. Do not enable this when two clients
    * must evaluate different contexts at the same time on one page, or when the
    * origin hosts untrusted documents that should not steer or read this stream.
+   *
+   * With `configSync`, sharing uses rules-only mode (not evaluated maps / context RPC).
    */
   shareConnection?: boolean;
   /**
@@ -243,16 +246,15 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
     this.env = options.env;
     this.enableFlagmint = options.enableFlagmint ?? true;
     this.configSync = options.configSync ?? false;
-    // Config-sync local eval needs a rules store + ECDH on this document.
-    // Connection sharing is off by default until rules snapshots are shared.
+    logger.setup({ debugLog: options.debugLog });
+
+    // Same default as server eval: share when BroadcastChannel exists.
+    // Config-sync uses rules-only share mode (see joinConnectionShare).
     this.shareConnection =
-      options.shareConnection ??
-      (this.configSync ? false : isConnectionSharingAvailable());
+      options.shareConnection ?? isConnectionSharingAvailable();
     if (this.configSync) {
       this.rulesStore = new RulesStore();
     }
-
-    logger.setup({ debugLog: options.debugLog });
 
     // Local-only evaluation
     if (this.previewMode && this.rawFlags && Object.keys(this.rawFlags).length > 0) {
@@ -331,7 +333,7 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
       }
 
       await this.setupTransport(options);
-      this.shareHub?.broadcastFlags(this.flags as Record<string, T>);
+      this.broadcastShareSnapshot();
 
       // E) Mark as initialized and resolve
       this.isInitialized = true;
@@ -382,20 +384,29 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
    * @returns true when this document is a follower and should skip opening a stream.
    */
   private async joinConnectionShare(options: FlagClientOptions<C>): Promise<boolean> {
-    if (!this.shareConnection || options.transport) {
+    if (!this.shareConnection) {
+      return false;
+    }
+    // Injected `transport` usually owns the stream alone. Still allow sharing
+    // when share hooks are provided (tests / custom channel + lock storage).
+    if (options.transport && !options.share) {
       return false;
     }
     if (!options.share && !isConnectionSharingAvailable()) {
       return false;
     }
 
-    this.shareHub = new ConnectionShareHub<C, T>(this.apiKey, options.share);
+    const shareMode = this.configSync ? 'rules' : 'evaluated';
+    this.shareHub = new ConnectionShareHub<C, T>(this.apiKey, {
+      ...options.share,
+      mode: shareMode,
+    });
     this.shareHub.onPromote(async () => {
       logger.log('[FlagClient] Share leader departed. Promoting this document to hold the stream.');
       try {
         await this.setupTransport(options);
         this.attachShareLeader();
-        this.shareHub?.broadcastFlags(this.flags as Record<string, T>);
+        this.broadcastShareSnapshot();
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
         logger.error('[FlagClient] Promotion to share leader failed:', error);
@@ -406,7 +417,14 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
     const role = await this.shareHub.join();
 
     if (role === 'follower') {
-      logger.log('[FlagClient] Following an existing Flagmint stream in another same-origin document.');
+      logger.log(
+        shareMode === 'rules'
+          ? '[FlagClient] Following shared config-sync rules from another same-origin document.'
+          : '[FlagClient] Following an existing Flagmint stream in another same-origin document.',
+      );
+      if (shareMode === 'rules') {
+        this.attachRulesShareFollower();
+      }
       this.transport = this.shareHub.createFollowerTransport();
       this.bindTransport(this.transport);
       await this.transport.init();
@@ -417,8 +435,15 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
     return false;
   }
 
+  /**
+   * Leader: wire context RPC for evaluated share only.
+   * Rules share never forwards follower context onto the stream.
+   */
   private attachShareLeader(): void {
-    this.shareHub?.setLeaderContextHandler(async (context, options) => {
+    if (!this.shareHub || this.shareHub.shareMode === 'rules') {
+      return;
+    }
+    this.shareHub.setLeaderContextHandler(async (context, options) => {
       const mergedContext = toJsonCloneable({ ...this.context, ...context } as C);
       if (options?.persist === true) {
         this.context = mergedContext;
@@ -427,15 +452,48 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
         }
       }
       if (!this.transport || typeof this.transport.fetchFlags !== 'function') {
-        if (this.configSync && this.rulesStore) {
-          return this.evaluateFromRulesStore(mergedContext) as Record<string, T>;
-        }
         return this.flags as Record<string, T>;
       }
       return this.transport.fetchFlags(mergedContext, {
         persist: options?.persist === true,
       });
     });
+  }
+
+  /**
+   * Follower hooks for rules-only share: hydrate rules locally and evaluate
+   * with this document's context (never the leader's).
+   */
+  private attachRulesShareFollower(): void {
+    if (!this.shareHub || !this.rulesStore) return;
+
+    this.shareHub.setFollowerRulesApply((payload) => {
+      this.rulesStore!.hydrateFromSnapshot(payload.snapshot);
+      if (payload.analytics) {
+        this.updateAnalytics(payload.analytics);
+      }
+      const flags = this.evaluateFromRulesStore() as Record<string, T>;
+      this.updateFlags(flags as FeatureFlags<T>, true);
+      return flags;
+    });
+
+    this.shareHub.setFollowerLocalEval((context) => {
+      return this.evaluateFromRulesStore(context) as Record<string, T>;
+    });
+  }
+
+  /**
+   * Leader: push the right snapshot type to followers after flags/rules change.
+   */
+  private broadcastShareSnapshot(): void {
+    if (!this.shareHub || this.shareHub.currentRole !== 'leader') return;
+    if (this.shareHub.shareMode === 'rules' && this.rulesStore) {
+      const snapshot = this.rulesStore.toSnapshot();
+      if (snapshot.flags.length === 0) return;
+      this.shareHub.broadcastRules(snapshot, this.analyticsMapFromRulesStore());
+      return;
+    }
+    this.shareHub.broadcastFlags(this.flags as Record<string, T>);
   }
 
   /**
@@ -606,7 +664,7 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
     this.notifySubscribers();
 
     if (!fromShare) {
-      this.shareHub?.broadcastFlags(newFlags as Record<string, T>);
+      this.broadcastShareSnapshot();
     }
   }
 

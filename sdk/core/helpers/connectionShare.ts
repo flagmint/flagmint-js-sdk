@@ -8,32 +8,29 @@
  *
  * This hub elects a single **leader** per API key:
  *
- * - **Leader** holds the real transport (handshake + EventSource). It broadcasts
- *   flag snapshots and errors over {@link BroadcastChannel}.
- * - **Followers** skip handshake and EventSource. They apply the leader's flags
- *   and forward `updateContext()` to the leader, which runs it on the shared
- *   stream.
+ * - **Leader** holds the real transport (handshake + EventSource).
+ * - **Followers** skip handshake and EventSource.
  *
- * Leadership is stored in `localStorage` (`flagmint_share_lock:<apiKey>`) with a
- * short TTL and heartbeat. `destroy()` and a `pagehide` / `beforeunload` listener
- * post `bye` and release the lock so another member can take over immediately.
- * If the document is killed without those events, followers wait until the lock
- * TTL expires.
+ * Two modes (separate BroadcastChannel / lock keys so they never mix):
  *
- * Sharing is a **browser** feature. Node cluster workers each need their own
- * stream — {@link isConnectionSharingAvailable} is false there. Do not share
- * when two clients on one page must keep different evaluation contexts at the
- * same time; `/context` is per connection, so the last write wins.
+ * - **`evaluated`** (server eval, default): leader broadcasts evaluated flag
+ *   maps; followers forward `updateContext` onto the leader stream (last write
+ *   wins). Same behavior as before.
+ * - **`rules`** (config sync): leader broadcasts verified **rules snapshots**;
+ *   each tab keeps its own context and evaluates locally. Followers do **not**
+ *   forward context to the leader.
  *
- * Trust: `BroadcastChannel` and `localStorage` are same-origin. Any document
- * on this origin (including a third-party iframe you host there) can join the
- * group, POST a context through the leader's authenticated stream, and read
- * the flags broadcast back. That is expected among trusted siblings. If the
- * origin serves untrusted content, set `shareConnection: false`.
+ * Leadership is stored in `localStorage` with a short TTL and heartbeat.
+ * `destroy()` and a `pagehide` / `beforeunload` listener post `bye` and release
+ * the lock so another member can take over immediately.
+ *
+ * Trust: `BroadcastChannel` and `localStorage` are same-origin. If the origin
+ * serves untrusted content, set `shareConnection: false`.
  *
  * @module connectionShare
  */
 import type { Transport } from '@/core/transports/Transport';
+import type { RulesCacheSnapshot } from '@/core/config-sync/types';
 import { logger } from '@/core/helpers/logger';
 import { toJsonCloneable } from '@/core/helpers/jsonCloneable';
 
@@ -47,19 +44,26 @@ const TAKEOVER_STAGGER_MS = 250;
 export type ShareRole = 'leader' | 'follower';
 
 /**
- * Messages exchanged on `flagmint-share:<apiKey>`.
- *
- * - `hello` — follower asking the leader to replay the current flag snapshot.
- * - `alive` — leader heartbeat; followers use lock TTL, not this, to detect death.
- * - `flags` — evaluated flag map from the leader's stream.
- * - `error` — transport/quota error mirrored to followers (`onError`).
- * - `context-request` / `context-result` — follower `updateContext` RPC.
- * - `bye` — leader is leaving; followers may acquire the lock.
+ * What the leader shares with followers.
+ * - `evaluated` — classic server-eval flag maps + context RPC
+ * - `rules` — config-sync rules snapshots; local eval per tab
+ */
+export type ConnectionShareMode = 'evaluated' | 'rules';
+
+/**
+ * Messages on `flagmint-share:<apiKey>` (`evaluated`) or
+ * `flagmint-share-rules:<apiKey>` (`rules`).
  */
 type ShareMessage<C = unknown, T = unknown> =
   | { type: 'hello'; memberId: string }
   | { type: 'alive'; memberId: string }
   | { type: 'flags'; memberId: string; flags: Record<string, T> }
+  | {
+      type: 'rules';
+      memberId: string;
+      snapshot: RulesCacheSnapshot;
+      analytics?: Record<string, boolean>;
+    }
   | { type: 'error'; memberId: string; message: string; code?: string; retryAfter?: number }
   | { type: 'context-request'; memberId: string; requestId: string; context: C; persist?: boolean }
   | { type: 'context-result'; requestId: string; flags?: Record<string, T>; error?: { message: string; code?: string } }
@@ -90,6 +94,11 @@ export interface ShareChannel {
  * `localStorage`, and `setInterval`.
  */
 export interface ConnectionShareOptions {
+  /**
+   * `evaluated` (default): server-eval share.
+   * `rules`: config-sync share — rules only, per-tab context.
+   */
+  mode?: ConnectionShareMode;
   /** Override `new BroadcastChannel(name)` (tests). */
   channelFactory?: (name: string) => ShareChannel;
   /** Override `localStorage` for the leadership lock (tests). */
@@ -141,8 +150,20 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
   private watchId: ReturnType<typeof setInterval> | null = null;
   private closed = false;
   private latestFlags: Record<string, T> | null = null;
+  private latestRules: {
+    snapshot: RulesCacheSnapshot;
+    analytics?: Record<string, boolean>;
+  } | null = null;
   private flagsWaiters: Array<(flags: Record<string, T>) => void> = [];
+  private rulesWaiters: Array<(payload: {
+    snapshot: RulesCacheSnapshot;
+    analytics?: Record<string, boolean>;
+  }) => void> = [];
   private flagsTimeouts: Array<{
+    timeoutId: ReturnType<typeof setTimeout>;
+    reject: (err: Error) => void;
+  }> = [];
+  private rulesTimeouts: Array<{
     timeoutId: ReturnType<typeof setTimeout>;
     reject: (err: Error) => void;
   }> = [];
@@ -155,6 +176,13 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
     context: C,
     options?: { persist?: boolean }
   ) => Promise<Record<string, T>>;
+  /** Rules mode: apply leader snapshot → return flags evaluated for this tab. */
+  private followerRulesApply?: (payload: {
+    snapshot: RulesCacheSnapshot;
+    analytics?: Record<string, boolean>;
+  }) => Record<string, T>;
+  /** Rules mode: re-evaluate after local `updateContext` (no leader RPC). */
+  private followerLocalEval?: (context: C) => Record<string, T>;
   private followerFlagsCallback?: (flags: Record<string, T>) => void;
   private followerErrorCallback?: (error: Error) => void;
   private readonly now: () => number;
@@ -166,6 +194,7 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
   private unloadHandler?: () => void;
   private readonly lockKey: string;
   private readonly channelName: string;
+  private readonly mode: ConnectionShareMode;
 
   /**
    * @param apiKey Share groups are keyed by API key. Distinct keys never share.
@@ -175,8 +204,15 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
     private readonly apiKey: string,
     options: ConnectionShareOptions = {}
   ) {
-    this.lockKey = `flagmint_share_lock:${apiKey}`;
-    this.channelName = `flagmint-share:${apiKey}`;
+    this.mode = options.mode ?? 'evaluated';
+    this.lockKey =
+      this.mode === 'rules'
+        ? `flagmint_share_rules_lock:${apiKey}`
+        : `flagmint_share_lock:${apiKey}`;
+    this.channelName =
+      this.mode === 'rules'
+        ? `flagmint-share-rules:${apiKey}`
+        : `flagmint-share:${apiKey}`;
     this.now = options.now ?? (() => Date.now());
     this.storage = options.storage ?? (typeof localStorage !== 'undefined' ? localStorage : null);
     this.channelFactory = options.channelFactory;
@@ -188,6 +224,11 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
   /** `leader` if this document holds the lock; otherwise `follower`. */
   get currentRole(): ShareRole {
     return this.role;
+  }
+
+  /** `evaluated` (server eval) or `rules` (config sync). */
+  get shareMode(): ConnectionShareMode {
+    return this.mode;
   }
 
   /**
@@ -242,13 +283,62 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
   }
 
   /**
+   * Rules-mode follower: hydrate local rules from the leader snapshot and
+   * return flags evaluated for **this** document's context.
+   *
+   * @param handler Apply snapshot + local eval → flag map
+   */
+  setFollowerRulesApply(
+    handler: (payload: {
+      snapshot: RulesCacheSnapshot;
+      analytics?: Record<string, boolean>;
+    }) => Record<string, T>,
+  ): void {
+    this.followerRulesApply = handler;
+  }
+
+  /**
+   * Rules-mode follower: re-evaluate after local `updateContext` (no RPC).
+   *
+   * @param handler Context → flag map using this tab's rules store
+   */
+  setFollowerLocalEval(handler: (context: C) => Record<string, T>): void {
+    this.followerLocalEval = handler;
+  }
+
+  /**
    * Leader-only: publish the current evaluated flags to all followers.
-   * No-op on followers (avoids echo loops).
+   * No-op on followers (avoids echo loops). Evaluated mode only.
+   *
+   * @param flags Evaluated flag map from the leader stream
    */
   broadcastFlags(flags: Record<string, T>): void {
+    if (this.mode !== 'evaluated') return;
     if (this.role !== 'leader' || !this.channel) return;
     this.latestFlags = flags;
     this.post({ type: 'flags', memberId: this.memberId, flags });
+  }
+
+  /**
+   * Leader-only (rules mode): publish a verified rules snapshot.
+   * Followers hydrate and evaluate with their own context.
+   *
+   * @param snapshot Rules store snapshot (MAC already verified on the leader)
+   * @param analytics Optional per-flag analytics map from rules
+   */
+  broadcastRules(
+    snapshot: RulesCacheSnapshot,
+    analytics?: Record<string, boolean>,
+  ): void {
+    if (this.mode !== 'rules') return;
+    if (this.role !== 'leader' || !this.channel) return;
+    this.latestRules = { snapshot, analytics };
+    this.post({
+      type: 'rules',
+      memberId: this.memberId,
+      snapshot,
+      analytics,
+    });
   }
 
   /** Leader-only: mirror a transport `onError` (auth, quota) to followers. */
@@ -264,11 +354,35 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
   }
 
   /**
-   * Transport used by follower FlagClients. `init` waits for the leader
-   * snapshot; `fetchFlags` RPCs `updateContext` through the leader.
+   * Transport used by follower FlagClients.
+   * - Evaluated: `init` waits for flags; `fetchFlags` RPCs through the leader.
+   * - Rules: `init` waits for a rules snapshot; `fetchFlags` evaluates locally.
    * `destroy` is a no-op — {@link ConnectionShareHub.destroy} owns teardown.
    */
   createFollowerTransport(): Transport<C, T> {
+    if (this.mode === 'rules') {
+      return {
+        init: async () => {
+          const payload = await this.waitForRules();
+          const flags = this.followerRulesApply?.(payload) ?? {};
+          this.followerFlagsCallback?.(flags);
+        },
+        fetchFlags: async (context: C) => {
+          if (!this.followerLocalEval) {
+            throw new Error('Rules-share follower has no local eval handler.');
+          }
+          return this.followerLocalEval(context);
+        },
+        destroy: () => undefined,
+        onFlagsUpdated: (callback) => {
+          this.followerFlagsCallback = callback;
+        },
+        onError: (callback) => {
+          this.followerErrorCallback = callback;
+        },
+      };
+    }
+
     return {
       init: async () => {
         const flags = await this.waitForFlags();
@@ -312,7 +426,12 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
       setTimeout(() => channel.close(), 0);
     }
     this.flagsWaiters = [];
+    this.rulesWaiters = [];
     this.flagsTimeouts.splice(0).forEach(({ timeoutId, reject }) => {
+      clearTimeout(timeoutId);
+      reject(new Error('Connection share hub closed.'));
+    });
+    this.rulesTimeouts.splice(0).forEach(({ timeoutId, reject }) => {
       clearTimeout(timeoutId);
       reject(new Error('Connection share hub closed.'));
     });
@@ -412,7 +531,15 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
 
     switch (message.type) {
       case 'hello':
-        if (this.role === 'leader' && this.latestFlags) {
+        if (this.role !== 'leader') break;
+        if (this.mode === 'rules' && this.latestRules) {
+          this.post({
+            type: 'rules',
+            memberId: this.memberId,
+            snapshot: this.latestRules.snapshot,
+            analytics: this.latestRules.analytics,
+          });
+        } else if (this.mode === 'evaluated' && this.latestFlags) {
           this.post({
             type: 'flags',
             memberId: this.memberId,
@@ -421,13 +548,27 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
         }
         break;
       case 'flags':
-        if (this.role === 'leader') return;
+        if (this.mode !== 'evaluated' || this.role === 'leader') return;
         if (!message.flags || typeof message.flags !== 'object' || Array.isArray(message.flags)) {
           return;
         }
         this.latestFlags = message.flags;
         this.flagsWaiters.splice(0).forEach((resolve) => resolve(message.flags));
         this.followerFlagsCallback?.(message.flags);
+        break;
+      case 'rules':
+        if (this.mode !== 'rules' || this.role === 'leader') return;
+        if (!message.snapshot || typeof message.snapshot !== 'object') return;
+        {
+          const payload = {
+            snapshot: message.snapshot,
+            analytics: message.analytics,
+          };
+          this.latestRules = payload;
+          this.rulesWaiters.splice(0).forEach((resolve) => resolve(payload));
+          const flags = this.followerRulesApply?.(payload) ?? {};
+          this.followerFlagsCallback?.(flags);
+        }
         break;
       case 'error':
         if (this.role === 'leader') return;
@@ -439,7 +580,8 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
         }
         break;
       case 'context-request':
-        if (this.role !== 'leader') return;
+        // Rules mode never forwards follower context onto the shared stream.
+        if (this.mode !== 'evaluated' || this.role !== 'leader') return;
         void this.handleContextRequest(message);
         break;
       case 'context-result':
@@ -526,6 +668,38 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
       };
       this.flagsWaiters.push(onFlags);
       this.flagsTimeouts.push({ timeoutId, reject });
+    });
+  }
+
+  /**
+   * Block until the leader has sent a `rules` snapshot, or {@link FOLLOWER_WAIT_MS}.
+   *
+   * @returns Latest rules payload from the leader
+   */
+  private waitForRules(): Promise<{
+    snapshot: RulesCacheSnapshot;
+    analytics?: Record<string, boolean>;
+  }> {
+    if (this.latestRules) return Promise.resolve(this.latestRules);
+    if (this.closed) return Promise.reject(new Error('Connection share hub closed.'));
+
+    return new Promise((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        this.rulesWaiters = this.rulesWaiters.filter((waiter) => waiter !== onRules);
+        this.rulesTimeouts = this.rulesTimeouts.filter((entry) => entry.timeoutId !== timeoutId);
+        reject(new Error('Timed out waiting for shared rules snapshot from the leader.'));
+      }, FOLLOWER_WAIT_MS);
+
+      const onRules = (payload: {
+        snapshot: RulesCacheSnapshot;
+        analytics?: Record<string, boolean>;
+      }) => {
+        clearTimeout(timeoutId);
+        this.rulesTimeouts = this.rulesTimeouts.filter((entry) => entry.timeoutId !== timeoutId);
+        resolve(payload);
+      };
+      this.rulesWaiters.push(onRules);
+      this.rulesTimeouts.push({ timeoutId, reject });
     });
   }
 

@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## Unreleased
+
+### Added
+
+- **Rules-only connection sharing for config sync (#24).** With `configSync: true` and `shareConnection` on, same-origin tabs/iframes elect one SSE leader and broadcast **verified rules snapshots** over a dedicated channel (`flagmint-share-rules:<apiKey>`). Followers hydrate locally and evaluate with **their own** context — no context RPC onto the leader stream. Server-eval sharing (`configSync` off) is unchanged (still shares evaluated maps + context RPC on `flagmint-share:<apiKey>`).
+
 ## [2.2.2] — 2026-10-14
 
 ### Added

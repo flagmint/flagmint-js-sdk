@@ -72,7 +72,9 @@ await client.ready();
 const enabled = client.getFlag('new_dashboard', false);
 ```
 
-Same-origin iframes that use this API key share one SSE connection by default **in browsers that provide `BroadcastChannel`**. Without it (older browsers, Node), each client opens its own stream. Set `shareConnection: false` if two clients on the page must keep different evaluation contexts at the same time, or if the origin hosts untrusted documents that should not share that stream.
+Same-origin iframes that use this API key share one SSE connection by default **in browsers that provide `BroadcastChannel`**. Without it (older browsers, Node), each client opens its own stream. Set `shareConnection: false` if the origin hosts untrusted documents that should not share that stream.
+
+With **`configSync: true`**, sharing still uses one stream, but only **rules** are broadcast — each tab keeps its own context and evaluates locally (so agent A and agent B in sibling tabs stay independent). Classic server eval still shares evaluated flag maps (last context write wins on that path).
 
 ## Node.js
 
@@ -132,7 +134,7 @@ After `ready()`:
 | `context` | object | `{}` | Initial evaluation context. Do not put secrets or PII here — the stream URL serializes this object in the query string |
 | `transportMode` | `'auto' \| 'sse' \| 'long-polling'` | `'auto'` | `auto` tries SSE, then long-polling |
 | `EventSourceImpl` | EventSource | browser global | Required in Node |
-| `shareConnection` | boolean | `true` in browsers with `BroadcastChannel`, `false` in Node | One stream per API key across same-origin documents |
+| `shareConnection` | boolean | `true` in browsers with `BroadcastChannel`, `false` in Node | One stream per API key across same-origin documents. With `configSync`, shares **rules** only (per-tab local eval). |
 | `enableOfflineCache` | boolean | `true` | Load/save flags via the cache adapter |
 | `persistContext` | boolean | `false` | Persist context in the cache adapter |
 | `cacheAdapter` | CacheAdapter | localStorage helpers | Custom cache (Redis, files, …) |
@@ -165,19 +167,31 @@ transportMode: 'long-polling'   // POST evaluate on an interval
 Used when the same app is embedded twice on one origin (for example two iframes in a host page).
 
 - **Leader** performs handshake and holds EventSource.
-- **Followers** receive flag snapshots over `BroadcastChannel` (`flagmint-share:<apiKey>`). Leadership is a `localStorage` lock (`flagmint_share_lock:<apiKey>`).
-- Follower `updateContext()` is forwarded to the leader, which runs it on the shared stream. Last write wins. Any same-origin document can send that RPC and see the flags that come back — turn sharing off if you host untrusted content on this origin.
-- If the leader iframe unloads, it posts `bye` so another member can take over immediately. If the tab is killed without `pagehide`, followers wait for the lock TTL.
+- **Followers** skip handshake/EventSource. Leadership is a `localStorage` lock.
+- **Server eval:** followers receive evaluated maps on `flagmint-share:<apiKey>`; `updateContext` is forwarded to the leader (last write wins).
+- **Config sync:** followers receive rules on `flagmint-share-rules:<apiKey>` and evaluate locally; context stays per tab.
+- If the leader iframe unloads, it posts `bye` so another member can take over immediately. If the tab is killed without `pagehide`, followers wait for the lock TTL. Turn sharing off if you host untrusted content on this origin.
 
 ```ts
 // Default in browsers with BroadcastChannel — one stream for this API key
 shareConnection: true
 
-// Two clients, two contexts, two streams — or no BroadcastChannel
+// Two independent streams (e.g. untrusted same-origin frames)
 shareConnection: false
+
+// configSync + share: one SSE for rules; each tab evaluates with its own context
+configSync: true
+shareConnection: true // default when BroadcastChannel exists
 ```
 
 Node cluster workers do not share. Each worker process opens its own stream.
+
+**Server eval vs config sync**
+
+| Mode | What is shared | Context |
+|------|----------------|---------|
+| Server eval (`configSync` off) | Evaluated flag maps | Follower `updateContext` goes through the leader (last write wins) |
+| Config sync | Verified **rules** snapshots only | Each tab’s own context; local `getFlag` / `updateContext` |
 
 ---
 
