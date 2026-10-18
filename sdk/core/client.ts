@@ -305,14 +305,16 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
         if (stored) this.context = stored;
       }
 
-      // B) Config-sync rules localCache (preferred over evaluated-flag cache)
+      // B) Config-sync: rules localCache only. Evaluated maps are per-context and
+      // must not live in API-key-scoped storage (last tab would win across tabs).
       let hydratedRules = false;
       if (this.configSync && this.rulesStore && this.enableOfflineCache) {
+        syncCache.clearCachedFlags(this.apiKey);
         hydratedRules = await this.hydrateRulesFromCache();
       }
 
-      // C) Cached evaluated flags (legacy / bootstrap when no rules snapshot)
-      if (this.enableOfflineCache && !hydratedRules) {
+      // C) Cached evaluated flags (server-eval bootstrap / offline only)
+      if (this.enableOfflineCache && !this.configSync && !hydratedRules) {
         const cached = await Promise.resolve(
           this.cacheAdapter.loadFlags(this.apiKey, this.cacheTTL)
         );
@@ -595,8 +597,10 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
   private updateFlags(newFlags: FeatureFlags<T>, fromShare = false): void {
     this.flags = newFlags;
 
-    // Cache the new flags
-    if (this.enableOfflineCache) {
+    // Server-eval: persist evaluated answers for offline bootstrap.
+    // Config-sync: never persist evaluated maps — they are context-specific and
+    // API-key keys are shared across same-origin tabs (last writer would win).
+    if (this.enableOfflineCache && !this.configSync) {
       void Promise.resolve(
         this.cacheAdapter.saveFlags(this.apiKey, newFlags)
       );

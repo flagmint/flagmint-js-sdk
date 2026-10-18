@@ -1,10 +1,37 @@
 import {
+  clearCachedFlags,
   clearCachedRulesSnapshot,
+  loadCachedFlags,
   loadCachedRulesSnapshot,
+  saveCachedFlags,
   saveCachedRulesSnapshot,
   setCacheStorage,
 } from './cacheHelper';
 import type { RulesCacheSnapshot } from '@/core/config-sync/types';
+
+describe('evaluated flags localCache helpers', () => {
+  const mem = new Map<string, string>();
+
+  beforeEach(() => {
+    mem.clear();
+    setCacheStorage({
+      getItem: (key) => mem.get(key) ?? null,
+      setItem: (key, value) => {
+        mem.set(key, value);
+      },
+      removeItem: (key) => {
+        mem.delete(key);
+      },
+    });
+  });
+
+  it('clears the evaluated flags entry', () => {
+    saveCachedFlags('ff_test', { demo: true });
+    expect(loadCachedFlags('ff_test', 60_000)).toEqual({ demo: true });
+    clearCachedFlags('ff_test');
+    expect(loadCachedFlags('ff_test', 60_000)).toBeNull();
+  });
+});
 
 describe('rules localCache helpers', () => {
   const mem = new Map<string, string>();
@@ -42,6 +69,56 @@ describe('rules localCache helpers', () => {
     };
     saveCachedRulesSnapshot('ff_test', snapshot);
     expect(loadCachedRulesSnapshot('ff_test')).toEqual(snapshot);
+  });
+
+  it('round-trips PII wire fields on a rules snapshot', () => {
+    const snapshot: RulesCacheSnapshot = {
+      version: 8,
+      expiresAt: Date.now() + 60_000,
+      flags: [
+        {
+          key: 'demo',
+          type: 'boolean',
+          is_active: true,
+          default_value: false,
+          targeting_rules: [],
+          variations: [{ id: 'on', value: true }],
+          rollouts: {},
+          analytics_enabled: true,
+        },
+      ],
+      segments: {},
+      piiAttributes: ['email'],
+      piiSalt: 'client-salt',
+      piiValueEncoding: 'hmac-v1',
+    };
+    saveCachedRulesSnapshot('ff_test', snapshot);
+    expect(loadCachedRulesSnapshot('ff_test')).toEqual(snapshot);
+  });
+
+  it('preserves piiWireBroken on load', () => {
+    const snapshot: RulesCacheSnapshot = {
+      version: 9,
+      expiresAt: Date.now() + 60_000,
+      flags: [
+        {
+          key: 'demo',
+          type: 'boolean',
+          is_active: true,
+          default_value: false,
+          targeting_rules: [],
+          variations: [],
+          rollouts: {},
+          analytics_enabled: false,
+        },
+      ],
+      segments: {},
+      piiWireBroken: true,
+    };
+    saveCachedRulesSnapshot('ff_test', snapshot);
+    expect(loadCachedRulesSnapshot('ff_test')).toMatchObject({
+      piiWireBroken: true,
+    });
   });
 
   it('rejects malformed snapshots', () => {
