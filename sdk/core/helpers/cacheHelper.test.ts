@@ -71,6 +71,56 @@ describe('rules localCache helpers', () => {
     expect(loadCachedRulesSnapshot('ff_test')).toEqual(snapshot);
   });
 
+  it('round-trips PII wire fields on a rules snapshot', () => {
+    const snapshot: RulesCacheSnapshot = {
+      version: 8,
+      expiresAt: Date.now() + 60_000,
+      flags: [
+        {
+          key: 'demo',
+          type: 'boolean',
+          is_active: true,
+          default_value: false,
+          targeting_rules: [],
+          variations: [{ id: 'on', value: true }],
+          rollouts: {},
+          analytics_enabled: true,
+        },
+      ],
+      segments: {},
+      piiAttributes: ['email'],
+      piiSalt: 'client-salt',
+      piiValueEncoding: 'hmac-v1',
+    };
+    saveCachedRulesSnapshot('ff_test', snapshot);
+    expect(loadCachedRulesSnapshot('ff_test')).toEqual(snapshot);
+  });
+
+  it('preserves piiWireBroken on load', () => {
+    const snapshot: RulesCacheSnapshot = {
+      version: 9,
+      expiresAt: Date.now() + 60_000,
+      flags: [
+        {
+          key: 'demo',
+          type: 'boolean',
+          is_active: true,
+          default_value: false,
+          targeting_rules: [],
+          variations: [],
+          rollouts: {},
+          analytics_enabled: false,
+        },
+      ],
+      segments: {},
+      piiWireBroken: true,
+    };
+    saveCachedRulesSnapshot('ff_test', snapshot);
+    expect(loadCachedRulesSnapshot('ff_test')).toMatchObject({
+      piiWireBroken: true,
+    });
+  });
+
   it('rejects malformed snapshots', () => {
     mem.set('flagmint_ff_test_rules', JSON.stringify({ version: 1 }));
     expect(loadCachedRulesSnapshot('ff_test')).toBeNull();

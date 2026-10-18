@@ -6,11 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
-## [2.2.3] — 2026-10-18
+## [2.2.3-rc.2] — 2026-10-18
+
+### Fixed
+
+- **Rules localCache PII fields.** `loadCachedRulesSnapshot` / `parseRulesSnapshot` no longer strip `piiAttributes`, `piiSalt`, `piiValueEncoding`, or `piiWireBroken`. Hydrate → re-persist was rewriting storage without PII, so email targeting failed after reload until a fresh `fullConfig`.
+
+> npm: `npm install flagmint-js-sdk@2.2.3-rc.2` (dist-tag `rc`).  
+> Note: `2.2.3-rc.1` was staged on npm but never became installable (E409); use `rc.2`.
+
+## [2.2.3-rc.1] — 2026-10-18
+
+Yanked / not installable (npm staged conflict). Same fix as `2.2.3-rc.2`.
+
+## [2.2.3-rc.0] — 2026-10-18
 
 ### Fixed
 
 - **Config-sync offline cache.** With `configSync: true`, do not load or save the evaluated flag map (`flagmint_<apiKey>_flags`). That entry is keyed only by API key, so the last tab to evaluate overwrote every other same-origin tab (e.g. agent19 hiding agent1’s button until localStorage was cleared). Rules localCache is unchanged. Server evaluation (`configSync` off) still caches evaluated flags as before.
+
+> npm: `npm install flagmint-js-sdk@2.2.3-rc.0` (dist-tag `rc`).
 
 ## [2.2.2] — 2026-10-14
 
