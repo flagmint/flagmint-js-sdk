@@ -1,10 +1,37 @@
 import {
+  clearCachedFlags,
   clearCachedRulesSnapshot,
+  loadCachedFlags,
   loadCachedRulesSnapshot,
+  saveCachedFlags,
   saveCachedRulesSnapshot,
   setCacheStorage,
 } from './cacheHelper';
 import type { RulesCacheSnapshot } from '@/core/config-sync/types';
+
+describe('evaluated flags localCache helpers', () => {
+  const mem = new Map<string, string>();
+
+  beforeEach(() => {
+    mem.clear();
+    setCacheStorage({
+      getItem: (key) => mem.get(key) ?? null,
+      setItem: (key, value) => {
+        mem.set(key, value);
+      },
+      removeItem: (key) => {
+        mem.delete(key);
+      },
+    });
+  });
+
+  it('clears the evaluated flags entry', () => {
+    saveCachedFlags('ff_test', { demo: true });
+    expect(loadCachedFlags('ff_test', 60_000)).toEqual({ demo: true });
+    clearCachedFlags('ff_test');
+    expect(loadCachedFlags('ff_test', 60_000)).toBeNull();
+  });
+});
 
 describe('rules localCache helpers', () => {
   const mem = new Map<string, string>();

@@ -88,6 +88,20 @@ export function saveCachedFlags<T>(apiKey: string, data: FeatureFlags<T>) {
   }
 }
 
+/**
+ * Drop the evaluated-flag localCache entry for an API key.
+ * Used when config-sync is on so a prior tab’s answers cannot poison another tab.
+ *
+ * @param apiKey SDK API key used as the storage key suffix
+ */
+export function clearCachedFlags(apiKey: string) {
+  try {
+    storage.removeItem?.(getFlagsKey(apiKey));
+  } catch {
+    // silent fail
+  }
+}
+
 export function loadCachedContext<C>(apiKey: string): C | null {
   try {
     const raw = storage.getItem(getContextKey(apiKey));

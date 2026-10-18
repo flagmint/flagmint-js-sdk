@@ -866,6 +866,38 @@ describe('FlagClient', () => {
     client.destroy();
   });
 
+  it('configSync does not load or save evaluated flag localCache', async () => {
+    const loadFlags = jest.fn(() => ({ wsd_internal_tester: false }));
+    const saveFlags = jest.fn();
+    const transport = createMockTransport();
+
+    const client = new FlagClient({
+      apiKey: 'ff_config_no_eval_cache',
+      context: { email: 'agent1@weseedo.nl' },
+      enableFlagmint: true,
+      deferInitialization: true,
+      shareConnection: false,
+      configSync: true,
+      enableOfflineCache: true,
+      transport,
+      cacheAdapter: {
+        loadFlags,
+        saveFlags,
+        loadContext: () => null,
+        saveContext: () => undefined,
+        loadRulesSnapshot: () => null,
+        saveRulesSnapshot: () => undefined,
+      },
+    });
+
+    await client.ready();
+    await client.updateContext({ email: 'agent1@weseedo.nl' });
+
+    expect(loadFlags).not.toHaveBeenCalled();
+    expect(saveFlags).not.toHaveBeenCalled();
+    client.destroy();
+  });
+
   it('keeps persist true on a local transport when persistContext is false', async () => {
     const transport = createMockTransport();
     const client = new FlagClient({

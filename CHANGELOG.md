@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [2.2.3] — 2026-10-18
+
+### Fixed
+
+- **Config-sync offline cache.** With `configSync: true`, do not load or save the evaluated flag map (`flagmint_<apiKey>_flags`). That entry is keyed only by API key, so the last tab to evaluate overwrote every other same-origin tab (e.g. agent19 hiding agent1’s button until localStorage was cleared). Rules localCache is unchanged. Server evaluation (`configSync` off) still caches evaluated flags as before.
+
 ## [2.2.2] — 2026-10-14
 
 ### Added
