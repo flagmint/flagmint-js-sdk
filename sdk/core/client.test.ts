@@ -1,5 +1,10 @@
 import { FlagClient } from './client';
 import type { Transport } from './transports/Transport';
+import {
+  loadCachedFlags,
+  saveCachedFlags,
+  setCacheStorage,
+} from './helpers/cacheHelper';
 
 function createMockTransport() {
   const fetchFlagsCalls: Array<{
@@ -866,14 +871,21 @@ describe('FlagClient', () => {
     client.destroy();
   });
 
-  it('configSync does not load or save evaluated flag localCache', async () => {
+  it('configSync + shareConnection false deletes leftover *_flags and never rewrites it', async () => {
+    const mem = memoryStorage();
+    setCacheStorage(mem);
+    const apiKey = 'ff_config_no_eval_cache';
+    // Stale last-write-wins entry from another tab / older SDK (agent19 answers).
+    saveCachedFlags(apiKey, { wsd_internal_tester: false });
+    expect(loadCachedFlags(apiKey, 60_000)).toEqual({ wsd_internal_tester: false });
+
     const loadFlags = jest.fn(() => ({ wsd_internal_tester: false }));
     const saveFlags = jest.fn();
     const transport = createMockTransport();
 
     const client = new FlagClient({
-      apiKey: 'ff_config_no_eval_cache',
-      context: { email: 'agent1@weseedo.nl' },
+      apiKey,
+      context: { kind: 'organization', key: 'wsd-app-anonymous' },
       enableFlagmint: true,
       deferInitialization: true,
       shareConnection: false,
@@ -893,6 +905,7 @@ describe('FlagClient', () => {
     await client.ready();
     await client.updateContext({ email: 'agent1@weseedo.nl' });
 
+    expect(loadCachedFlags(apiKey, 60_000)).toBeNull();
     expect(loadFlags).not.toHaveBeenCalled();
     expect(saveFlags).not.toHaveBeenCalled();
     client.destroy();

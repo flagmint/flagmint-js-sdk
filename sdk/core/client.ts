@@ -313,10 +313,15 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
 
       // B) Config-sync: rules localCache only. Evaluated maps are per-context and
       // must not live in API-key-scoped storage (last tab would win across tabs).
+      // Always drop leftover `*_flags` even when offline cache is off — e.g. after
+      // switching from server-eval, or when shareConnection is false but tabs
+      // still share localStorage.
       let hydratedRules = false;
-      if (this.configSync && this.rulesStore && this.enableOfflineCache) {
+      if (this.configSync && this.rulesStore) {
         syncCache.clearCachedFlags(this.apiKey);
-        hydratedRules = await this.hydrateRulesFromCache();
+        if (this.enableOfflineCache) {
+          hydratedRules = await this.hydrateRulesFromCache();
+        }
       }
 
       // C) Cached evaluated flags (server-eval bootstrap / offline only)

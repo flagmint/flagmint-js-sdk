@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Config-sync offline cache (#25).** With `configSync: true`, do not load or save `flagmint_<apiKey>_flags` (evaluated answers keyed only by API key → last tab wins). On init, delete any leftover entry. Persist **rules** only (`flagmint_<apiKey>_rules`).
+
 - **Rules localCache PII fields.** `loadCachedRulesSnapshot` / `parseRulesSnapshot` no longer strip `piiAttributes`, `piiSalt`, `piiValueEncoding`, or `piiWireBroken`. Hydrate → re-persist was rewriting storage without PII, so email targeting failed after reload until a fresh `fullConfig`.
 
 - **Rules-only connection sharing for config sync (#24).** With `configSync: true` and `shareConnection` on, same-origin tabs/iframes elect one SSE leader and broadcast **verified rules snapshots** over a dedicated channel (`flagmint-share-rules:<apiKey>`). Followers hydrate locally and evaluate with **their own** context — no context RPC onto the leader stream. Server-eval sharing (`configSync` off) is unchanged (still shares evaluated maps + context RPC on `flagmint-share:<apiKey>`).
@@ -18,7 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.2.3-rc.1] — 2026-10-18
 
-Yanked / not installable (npm staged conflict). Same fix as `2.2.3-rc.2`.
+Yanked / not installable (npm staged conflict). Included the config-sync offline-cache fix from `2.2.3-rc.0`.
+
+## [2.2.3-rc-2] — 2026-10-18
+
+### Fixed
+
+- Rules-only connection sharing for config sync (#24) and rules localCache PII fields (see `[2.2.3]` above).
+
+### Known issue
+
+- **Regressed** the config-sync offline-cache fix from `2.2.3-rc.0`: still load/save `flagmint_<apiKey>_flags` under `configSync`, so same-origin tabs last-write-wins. Fixed again in source for the next `2.2.3` publish (clear on init + never persist evaluated maps when `configSync` is on).
 
 ## [2.2.3-rc.0] — 2026-10-18
 
