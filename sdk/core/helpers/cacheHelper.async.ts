@@ -96,13 +96,22 @@ export async function saveCachedFlags<T>(apiKey: string, data: FeatureFlags<T>):
 
 /**
  * Drop the evaluated-flag localCache entry for an API key (async adapter).
+ * Prefer `removeItem`; if the adapter omits it, overwrite with an immediately
+ * expired empty blob so {@link loadCachedFlags} returns null.
  *
  * @param apiKey SDK API key used as the storage key suffix
  */
 export async function clearCachedFlags(apiKey: string): Promise<void> {
   if (!storage) throw new Error('Async storage not set');
+  const key = getFlagsKey(apiKey);
   try {
-    await storage.removeItem?.(getFlagsKey(apiKey));
+    if (typeof storage.removeItem === 'function') {
+      await storage.removeItem(key);
+      return;
+    }
+    // Adapters may omit removeItem — still invalidate so a later server-eval
+    // session cannot revive last-write-wins answers until wall-clock TTL.
+    await storage.setItem(key, JSON.stringify({ ts: 0, data: {} }));
   } catch {
     // silent fail
   }

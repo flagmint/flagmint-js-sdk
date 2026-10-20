@@ -113,12 +113,21 @@ export function saveCachedFlags<T>(apiKey: string, data: FeatureFlags<T>) {
 /**
  * Drop the evaluated-flag localCache entry for an API key.
  * Used when config-sync is on so a prior tab’s answers cannot poison another tab.
+ * Prefer `removeItem`; if the adapter omits it, overwrite with an immediately
+ * expired empty blob so {@link loadCachedFlags} returns null.
  *
  * @param apiKey SDK API key used as the storage key suffix
  */
 export function clearCachedFlags(apiKey: string) {
+  const key = getFlagsKey(apiKey);
   try {
-    storage.removeItem?.(getFlagsKey(apiKey));
+    if (typeof storage.removeItem === 'function') {
+      storage.removeItem(key);
+      return;
+    }
+    // Adapters may omit removeItem — still invalidate so a later server-eval
+    // session cannot revive last-write-wins answers until wall-clock TTL.
+    storage.setItem(key, JSON.stringify({ ts: 0, data: {} }));
   } catch {
     // silent fail
   }

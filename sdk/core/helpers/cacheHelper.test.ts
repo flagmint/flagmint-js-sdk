@@ -31,6 +31,19 @@ describe('evaluated flags localCache helpers', () => {
     clearCachedFlags('ff_test');
     expect(loadCachedFlags('ff_test', 60_000)).toBeNull();
   });
+
+  it('invalidates evaluated flags when the adapter has no removeItem', () => {
+    setCacheStorage({
+      getItem: (key) => mem.get(key) ?? null,
+      setItem: (key, value) => {
+        mem.set(key, value);
+      },
+    });
+    saveCachedFlags('ff_test', { demo: true });
+    expect(loadCachedFlags('ff_test', 60_000)).toEqual({ demo: true });
+    clearCachedFlags('ff_test');
+    expect(loadCachedFlags('ff_test', 60_000)).toBeNull();
+  });
 });
 
 describe('rules localCache helpers', () => {
