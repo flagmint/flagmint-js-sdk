@@ -871,45 +871,51 @@ describe('FlagClient', () => {
     client.destroy();
   });
 
-  it('configSync + shareConnection false deletes leftover *_flags and never rewrites it', async () => {
-    const mem = memoryStorage();
-    setCacheStorage(mem);
-    const apiKey = 'ff_config_no_eval_cache';
-    // Stale last-write-wins entry from another tab / older SDK (agent19 answers).
-    saveCachedFlags(apiKey, { wsd_internal_tester: false });
-    expect(loadCachedFlags(apiKey, 60_000)).toEqual({ wsd_internal_tester: false });
+  it.each([false, true])(
+    'configSync + shareConnection %s deletes leftover *_flags and never rewrites it',
+    async (shareConnection) => {
+      const mem = memoryStorage();
+      setCacheStorage(mem);
+      const apiKey = `ff_config_no_eval_cache_${shareConnection}`;
+      // Stale last-write-wins entry from another tab / older SDK (agent19 answers).
+      saveCachedFlags(apiKey, { wsd_internal_tester: false });
+      expect(loadCachedFlags(apiKey, 60_000)).toEqual({ wsd_internal_tester: false });
 
-    const loadFlags = jest.fn(() => ({ wsd_internal_tester: false }));
-    const saveFlags = jest.fn();
-    const transport = createMockTransport();
+      const loadFlags = jest.fn(() => ({ wsd_internal_tester: false }));
+      const saveFlags = jest.fn();
+      const transport = createMockTransport();
 
-    const client = new FlagClient({
-      apiKey,
-      context: { kind: 'organization', key: 'wsd-app-anonymous' },
-      enableFlagmint: true,
-      deferInitialization: true,
-      shareConnection: false,
-      configSync: true,
-      enableOfflineCache: true,
-      transport,
-      cacheAdapter: {
-        loadFlags,
-        saveFlags,
-        loadContext: () => null,
-        saveContext: () => undefined,
-        loadRulesSnapshot: () => null,
-        saveRulesSnapshot: () => undefined,
-      },
-    });
+      const client = new FlagClient({
+        apiKey,
+        context: { kind: 'organization', key: 'wsd-app-anonymous' },
+        enableFlagmint: true,
+        deferInitialization: true,
+        shareConnection,
+        configSync: true,
+        enableOfflineCache: true,
+        transport,
+        ...(shareConnection
+          ? { share: shareHooks() }
+          : {}),
+        cacheAdapter: {
+          loadFlags,
+          saveFlags,
+          loadContext: () => null,
+          saveContext: () => undefined,
+          loadRulesSnapshot: () => null,
+          saveRulesSnapshot: () => undefined,
+        },
+      });
 
-    await client.ready();
-    await client.updateContext({ email: 'agent1@weseedo.nl' });
+      await client.ready();
+      await client.updateContext({ email: 'agent1@weseedo.nl' });
 
-    expect(loadCachedFlags(apiKey, 60_000)).toBeNull();
-    expect(loadFlags).not.toHaveBeenCalled();
-    expect(saveFlags).not.toHaveBeenCalled();
-    client.destroy();
-  });
+      expect(loadCachedFlags(apiKey, 60_000)).toBeNull();
+      expect(loadFlags).not.toHaveBeenCalled();
+      expect(saveFlags).not.toHaveBeenCalled();
+      client.destroy();
+    },
+  );
 
   it('keeps persist true on a local transport when persistContext is false', async () => {
     const transport = createMockTransport();

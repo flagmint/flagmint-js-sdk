@@ -234,15 +234,6 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
       (sseIsCustom && !restIsCustom
         ? this.sseEndpoint
         : flagsBaseFromRestEndpoint(this.restEndpoint));
-    this.cacheAdapter = options.cacheAdapter ?? {
-      loadFlags: syncCache.loadCachedFlags,
-      saveFlags: syncCache.saveCachedFlags,
-      loadContext: syncCache.loadCachedContext,
-      saveContext: syncCache.saveCachedContext,
-      loadRulesSnapshot: syncCache.loadCachedRulesSnapshot,
-      saveRulesSnapshot: syncCache.saveCachedRulesSnapshot,
-    };
-
     this.context = toJsonCloneable((options.context || ({} as C)));
     this.rawFlags = options.rawFlags ?? {};
     this.previewMode = options.previewMode || false;
@@ -251,6 +242,24 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
     this.enableFlagmint = options.enableFlagmint ?? true;
     this.configSync = options.configSync ?? false;
     logger.setup({ debugLog: options.debugLog });
+
+    const defaultAdapter: CacheAdapter<C> = {
+      loadFlags: syncCache.loadCachedFlags,
+      saveFlags: syncCache.saveCachedFlags,
+      loadContext: syncCache.loadCachedContext,
+      saveContext: syncCache.saveCachedContext,
+      loadRulesSnapshot: syncCache.loadCachedRulesSnapshot,
+      saveRulesSnapshot: syncCache.saveCachedRulesSnapshot,
+    };
+    const baseAdapter = options.cacheAdapter ?? defaultAdapter;
+    // Config-sync: never persist evaluated maps (API-key key = last tab wins),
+    // even if a custom adapter or future call site forgets the updateFlags guard.
+    this.cacheAdapter = this.configSync
+      ? {
+          ...baseAdapter,
+          saveFlags: () => undefined,
+        }
+      : baseAdapter;
 
     // Same default as server eval: share when BroadcastChannel exists.
     // Config-sync uses rules-only share mode (see joinConnectionShare).
@@ -708,9 +717,12 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
     this.flags = newFlags;
 
     // Server-eval: persist evaluated answers for offline bootstrap.
-    // Config-sync: never persist evaluated maps — they are context-specific and
-    // API-key keys are shared across same-origin tabs (last writer would win).
-    if (this.enableOfflineCache && !this.configSync) {
+    // Config-sync: adapter.saveFlags is already a no-op; also drop any leftover
+    // `*_flags` key (e.g. from an older SDK / server-eval session) so share +
+    // local eval never keep last-write-wins answers in storage.
+    if (this.configSync) {
+      syncCache.clearCachedFlags(this.apiKey);
+    } else if (this.enableOfflineCache) {
       void Promise.resolve(
         this.cacheAdapter.saveFlags(this.apiKey, newFlags)
       );

@@ -38592,12 +38592,27 @@ function parseRulesSnapshot$1(raw) {
     if (!parsed || typeof parsed.version !== "number" || typeof parsed.expiresAt !== "number" || !Array.isArray(parsed.flags) || typeof parsed.segments !== "object" || parsed.segments === null) {
       return null;
     }
-    return {
+    const snapshot = {
       version: parsed.version,
       expiresAt: parsed.expiresAt,
       flags: parsed.flags,
       segments: parsed.segments || {}
     };
+    if (Array.isArray(parsed.piiAttributes)) {
+      snapshot.piiAttributes = parsed.piiAttributes.filter(
+        (attr) => typeof attr === "string"
+      );
+    }
+    if (typeof parsed.piiSalt === "string") {
+      snapshot.piiSalt = parsed.piiSalt;
+    }
+    if (typeof parsed.piiValueEncoding === "string") {
+      snapshot.piiValueEncoding = parsed.piiValueEncoding;
+    }
+    if (parsed.piiWireBroken === true) {
+      snapshot.piiWireBroken = true;
+    }
+    return snapshot;
   } catch {
     return null;
   }
@@ -38618,6 +38633,17 @@ function loadCachedFlags$1(apiKey, ttl) {
 function saveCachedFlags$1(apiKey, data) {
   try {
     storage$1.setItem(getFlagsKey$1(apiKey), JSON.stringify({ ts: Date.now(), data }));
+  } catch {
+  }
+}
+function clearCachedFlags$1(apiKey) {
+  const key2 = getFlagsKey$1(apiKey);
+  try {
+    if (typeof storage$1.removeItem === "function") {
+      storage$1.removeItem(key2);
+      return;
+    }
+    storage$1.setItem(key2, JSON.stringify({ ts: 0, data: {} }));
   } catch {
   }
 }
@@ -38659,6 +38685,7 @@ function clearCachedRulesSnapshot$1(apiKey) {
 }
 const cacheHelper = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
   __proto__: null,
+  clearCachedFlags: clearCachedFlags$1,
   clearCachedRulesSnapshot: clearCachedRulesSnapshot$1,
   loadCachedContext: loadCachedContext$1,
   loadCachedFlags: loadCachedFlags$1,
@@ -39093,7 +39120,7 @@ class SseTransport {
     this.connectPromise = new Promise((resolve, reject) => {
       this.connectResolve = resolve;
       this.connectReject = reject;
-      const sdkVersion = "2.2.1";
+      const sdkVersion = "2.2.3";
       const platform2 = typeof window !== "undefined" ? "browser" : "nodejs";
       const wrapperName = this.configOptions?.wrapper?.name || "native-js";
       const wrapperVersion = this.configOptions?.wrapper?.version || "none";
@@ -39362,11 +39389,15 @@ class ConnectionShareHub {
     this.watchId = null;
     this.closed = false;
     this.latestFlags = null;
+    this.latestRules = null;
     this.flagsWaiters = [];
+    this.rulesWaiters = [];
     this.flagsTimeouts = [];
+    this.rulesTimeouts = [];
     this.contextWaiters = /* @__PURE__ */ new Map();
-    this.lockKey = `flagmint_share_lock:${apiKey}`;
-    this.channelName = `flagmint-share:${apiKey}`;
+    this.mode = options.mode ?? "evaluated";
+    this.lockKey = this.mode === "rules" ? `flagmint_share_rules_lock:${apiKey}` : `flagmint_share_lock:${apiKey}`;
+    this.channelName = this.mode === "rules" ? `flagmint-share-rules:${apiKey}` : `flagmint-share:${apiKey}`;
     this.now = options.now ?? (() => Date.now());
     this.storage = options.storage ?? (typeof localStorage !== "undefined" ? localStorage : null);
     this.channelFactory = options.channelFactory;
@@ -39377,6 +39408,10 @@ class ConnectionShareHub {
   /** `leader` if this document holds the lock; otherwise `follower`. */
   get currentRole() {
     return this.role;
+  }
+  /** `evaluated` (server eval) or `rules` (config sync). */
+  get shareMode() {
+    return this.mode;
   }
   /**
    * Join the share group: compete for the lock, subscribe to the channel.
@@ -39422,14 +39457,76 @@ class ConnectionShareHub {
     this.leaderContextHandler = handler;
   }
   /**
-   * Leader-only: publish the current evaluated flags to all followers.
-   * No-op on followers (avoids echo loops).
+   * Rules-mode follower: hydrate local rules from the leader snapshot and
+   * return flags evaluated for **this** document's context.
+   *
+   * @param handler Apply snapshot + local eval → flag map
+   */
+  setFollowerRulesApply(handler) {
+    this.followerRulesApply = handler;
+  }
+  /**
+   * Rules-mode follower: re-evaluate after local `updateContext` (no RPC).
+   *
+   * @param handler Context → flag map using this tab's rules store
+   */
+  setFollowerLocalEval(handler) {
+    this.followerLocalEval = handler;
+  }
+  /**
+   * Rules-mode leader: run when a follower asks for lease renew (SSE reconnect).
+   *
+   * @param handler Typically `transport.requestReconnect('lease_renew_requested')`
+   */
+  setLeaderLeaseRenewHandler(handler) {
+    this.leaderLeaseRenewHandler = handler;
+  }
+  /**
+   * Ask the share leader to renew the config-sync lease (reconnect SSE).
+   * Leaders invoke the handler locally; followers post `lease-renew-request`.
+   */
+  requestLeaseRenew() {
+    if (this.mode !== "rules")
+      return;
+    if (this.role === "leader") {
+      this.leaderLeaseRenewHandler?.();
+      return;
+    }
+    this.post({ type: "lease-renew-request", memberId: this.memberId });
+  }
+  /**
+   * Leader-only (non-rules mode): publish the current evaluated flags to all followers.
+   * No-op on followers (avoids echo loops). Evaluated mode only.
+   *
+   * @param flags Evaluated flag map from the leader stream
    */
   broadcastFlags(flags) {
+    if (this.mode !== "evaluated")
+      return;
     if (this.role !== "leader" || !this.channel)
       return;
     this.latestFlags = flags;
     this.post({ type: "flags", memberId: this.memberId, flags });
+  }
+  /**
+   * Leader-only (rules mode): publish a verified rules snapshot.
+   * Followers hydrate and evaluate with their own context.
+   *
+   * @param snapshot Rules store snapshot (MAC already verified on the leader)
+   * @param analytics Optional per-flag analytics map from rules
+   */
+  broadcastRules(snapshot, analytics) {
+    if (this.mode !== "rules")
+      return;
+    if (this.role !== "leader" || !this.channel)
+      return;
+    this.latestRules = { snapshot, analytics };
+    this.post({
+      type: "rules",
+      memberId: this.memberId,
+      snapshot,
+      analytics
+    });
   }
   /** Leader-only: mirror a transport `onError` (auth, quota) to followers. */
   broadcastError(error2) {
@@ -39444,11 +39541,42 @@ class ConnectionShareHub {
     });
   }
   /**
-   * Transport used by follower FlagClients. `init` waits for the leader
-   * snapshot; `fetchFlags` RPCs `updateContext` through the leader.
+   * Transport used by follower FlagClients.
+   * - Evaluated: `init` waits for flags; `fetchFlags` RPCs through the leader.
+   * - Rules: `init` waits for a rules snapshot; `fetchFlags` evaluates locally.
    * `destroy` is a no-op — {@link ConnectionShareHub.destroy} owns teardown.
    */
   createFollowerTransport() {
+    if (this.mode === "rules") {
+      return {
+        init: async () => {
+          const payload = await this.waitForRules();
+          const flags = this.followerRulesApply?.(payload) ?? {};
+          this.followerFlagsCallback?.(flags);
+        },
+        fetchFlags: async (context) => {
+          if (!this.followerLocalEval) {
+            throw new Error("Rules-share follower has no local eval handler.");
+          }
+          return this.followerLocalEval(context);
+        },
+        /**
+         * Follower has no SSE — ask the leader to reconnect for a fresh lease.
+         *
+         * @param _reason Ignored; leader always reconnects for renew
+         */
+        requestReconnect: (_reason) => {
+          this.requestLeaseRenew();
+        },
+        destroy: () => void 0,
+        onFlagsUpdated: (callback) => {
+          this.followerFlagsCallback = callback;
+        },
+        onError: (callback) => {
+          this.followerErrorCallback = callback;
+        }
+      };
+    }
     return {
       init: async () => {
         const flags = await this.waitForFlags();
@@ -39491,7 +39619,12 @@ class ConnectionShareHub {
       setTimeout(() => channel.close(), 0);
     }
     this.flagsWaiters = [];
+    this.rulesWaiters = [];
     this.flagsTimeouts.splice(0).forEach(({ timeoutId, reject }) => {
+      clearTimeout(timeoutId);
+      reject(new Error("Connection share hub closed."));
+    });
+    this.rulesTimeouts.splice(0).forEach(({ timeoutId, reject }) => {
       clearTimeout(timeoutId);
       reject(new Error("Connection share hub closed."));
     });
@@ -39513,9 +39646,19 @@ class ConnectionShareHub {
     this.unloadHandler = void 0;
   }
   /**
-   * JSON-clone then post. Native `BroadcastChannel` structured-clones the
-   * payload; Vue reactive Proxies and similar host objects throw
-   * `DataCloneError`. JSON.stringify can walk those Proxies.
+   * Post a share-hub message after forcing a plain JSON clone.
+   *
+   * `BroadcastChannel.postMessage` uses the structured-clone algorithm. That
+   * rejects Vue reactive Proxies (and similar host objects) with
+   * `DataCloneError`, which would break multi-tab share when the app passes
+   * a reactive context or flag map.
+   *
+   * We run {@link toJsonCloneable} first: `JSON.stringify` can walk those
+   * Proxies into a plain object tree that structured clone accepts. If the
+   * value still cannot be serialized (functions, DOM nodes, cycles), we throw
+   * `ERR_CONTEXT_NOT_CLONEABLE` instead of a bare `DataCloneError`.
+   *
+   * @param message Share protocol payload (flags, rules, context RPC, etc.)
    */
   post(message) {
     if (!this.channel)
@@ -39591,7 +39734,16 @@ class ConnectionShareHub {
       return;
     switch (message.type) {
       case "hello":
-        if (this.role === "leader" && this.latestFlags) {
+        if (this.role !== "leader")
+          break;
+        if (this.mode === "rules" && this.latestRules) {
+          this.post({
+            type: "rules",
+            memberId: this.memberId,
+            snapshot: this.latestRules.snapshot,
+            analytics: this.latestRules.analytics
+          });
+        } else if (this.mode === "evaluated" && this.latestFlags) {
           this.post({
             type: "flags",
             memberId: this.memberId,
@@ -39600,7 +39752,7 @@ class ConnectionShareHub {
         }
         break;
       case "flags":
-        if (this.role === "leader")
+        if (this.mode !== "evaluated" || this.role === "leader")
           return;
         if (!message.flags || typeof message.flags !== "object" || Array.isArray(message.flags)) {
           return;
@@ -39608,6 +39760,22 @@ class ConnectionShareHub {
         this.latestFlags = message.flags;
         this.flagsWaiters.splice(0).forEach((resolve) => resolve(message.flags));
         this.followerFlagsCallback?.(message.flags);
+        break;
+      case "rules":
+        if (this.mode !== "rules" || this.role === "leader")
+          return;
+        if (!message.snapshot || typeof message.snapshot !== "object")
+          return;
+        {
+          const payload = {
+            snapshot: message.snapshot,
+            analytics: message.analytics
+          };
+          this.latestRules = payload;
+          this.rulesWaiters.splice(0).forEach((resolve) => resolve(payload));
+          const flags = this.followerRulesApply?.(payload) ?? {};
+          this.followerFlagsCallback?.(flags);
+        }
         break;
       case "error":
         if (this.role === "leader")
@@ -39620,8 +39788,13 @@ class ConnectionShareHub {
           this.followerErrorCallback?.(err);
         }
         break;
+      case "lease-renew-request":
+        if (this.mode !== "rules" || this.role !== "leader")
+          return;
+        this.leaderLeaseRenewHandler?.();
+        break;
       case "context-request":
-        if (this.role !== "leader")
+        if (this.mode !== "evaluated" || this.role !== "leader")
           return;
         void this.handleContextRequest(message);
         break;
@@ -39704,6 +39877,31 @@ class ConnectionShareHub {
       };
       this.flagsWaiters.push(onFlags);
       this.flagsTimeouts.push({ timeoutId, reject });
+    });
+  }
+  /**
+   * Block until the leader has sent a `rules` snapshot, or {@link FOLLOWER_WAIT_MS}.
+   *
+   * @returns Latest rules payload from the leader
+   */
+  waitForRules() {
+    if (this.latestRules)
+      return Promise.resolve(this.latestRules);
+    if (this.closed)
+      return Promise.reject(new Error("Connection share hub closed."));
+    return new Promise((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        this.rulesWaiters = this.rulesWaiters.filter((waiter) => waiter !== onRules);
+        this.rulesTimeouts = this.rulesTimeouts.filter((entry) => entry.timeoutId !== timeoutId);
+        reject(new Error("Timed out waiting for shared rules snapshot from the leader."));
+      }, FOLLOWER_WAIT_MS);
+      const onRules = (payload) => {
+        clearTimeout(timeoutId);
+        this.rulesTimeouts = this.rulesTimeouts.filter((entry) => entry.timeoutId !== timeoutId);
+        resolve(payload);
+      };
+      this.rulesWaiters.push(onRules);
+      this.rulesTimeouts.push({ timeoutId, reject });
     });
   }
   /**
@@ -41779,7 +41977,7 @@ function expand2(hash3, prk, info, length = 32) {
 const hkdf = (hash3, ikm, salt, info, length) => expand2(hash3, extract(hash3, ikm, salt), info, length);
 const ASL_HKDF_INFO = "flagmint-asl-config-sync-mac-v1";
 const ASL_KEY_AGREEMENT = "x25519-hkdf-sha256";
-const textEncoder$1 = new TextEncoder();
+const textEncoder$2 = new TextEncoder();
 function generateAslClientKeyPair() {
   const privateKey = x25519.utils.randomSecretKey();
   const publicKey = x25519.getPublicKey(privateKey);
@@ -41810,7 +42008,7 @@ function deriveAslMacKey(input) {
     sha256,
     shared,
     salt,
-    textEncoder$1.encode(ASL_HKDF_INFO),
+    textEncoder$2.encode(ASL_HKDF_INFO),
     32
   );
   return { configMacKey };
@@ -41820,7 +42018,7 @@ function wipeKeyMaterial(key2) {
     return;
   key2.fill(0);
 }
-const textEncoder = new TextEncoder();
+const textEncoder$1 = new TextEncoder();
 function canonicalizeForSigning(value) {
   return JSON.stringify(sortValue(value));
 }
@@ -41837,12 +42035,12 @@ function sortValue(value) {
   return sorted;
 }
 function normalizeMacKey(secret2) {
-  return typeof secret2 === "string" ? textEncoder.encode(secret2) : secret2;
+  return typeof secret2 === "string" ? textEncoder$1.encode(secret2) : secret2;
 }
 function signConfigPayload(body, secret2) {
   const { signature: _ignored, ...unsigned } = body;
   const canonical = canonicalizeForSigning(unsigned);
-  const mac = hmac2(sha256, normalizeMacKey(secret2), textEncoder.encode(canonical));
+  const mac = hmac2(sha256, normalizeMacKey(secret2), textEncoder$1.encode(canonical));
   return bytesToHex$1(mac);
 }
 function timingSafeEqualBytes(a, b) {
@@ -41864,12 +42062,164 @@ function verifyConfigPayloadSignature(body, secret2) {
   } catch {
     return false;
   }
-  const a = textEncoder.encode(body.signature);
-  const b = textEncoder.encode(expected);
+  const a = textEncoder$1.encode(body.signature);
+  const b = textEncoder$1.encode(expected);
   return timingSafeEqualBytes(a, b);
 }
 function isConfigPayloadExpired(expiresAt, now = Date.now()) {
   return !Number.isFinite(expiresAt) || now >= expiresAt;
+}
+const PII_VALUE_ENCODING = "hmac-v1";
+const textEncoder = new TextEncoder();
+function normalizePiiString(value) {
+  return value.trim().toLowerCase();
+}
+function hashPiiValue(value, salt) {
+  const mac = hmac2(
+    sha256,
+    textEncoder.encode(salt),
+    textEncoder.encode(normalizePiiString(value))
+  );
+  return bytesToHex$1(mac);
+}
+function isPiiAttribute(attribute, piiAttributes) {
+  if (!attribute || piiAttributes.length === 0)
+    return false;
+  const attr = attribute.trim();
+  if (!attr)
+    return false;
+  for (const key2 of piiAttributes) {
+    if (!key2)
+      continue;
+    if (attr === key2)
+      return true;
+    if (attr.endsWith(`.${key2}`))
+      return true;
+  }
+  return false;
+}
+function payloadHasExplicitPiiFields(payload) {
+  if (!payload)
+    return false;
+  return payload.piiSalt !== void 0 || payload.piiAttributes !== void 0 || payload.piiValueEncoding !== void 0;
+}
+function piiAttributeKeysFromPayload(payload) {
+  if (!payload || !Array.isArray(payload.piiAttributes))
+    return [];
+  return payload.piiAttributes.filter((k) => typeof k === "string" && k.length > 0);
+}
+function hasMalformedPiiAttributes(payload) {
+  if (!payload || payload.piiAttributes === void 0)
+    return false;
+  if (!Array.isArray(payload.piiAttributes))
+    return true;
+  return payload.piiAttributes.some(
+    (entry) => typeof entry !== "string" || entry.length === 0
+  );
+}
+function hasExplicitInvalidPiiEncoding(payload) {
+  if (!payload || payload.piiValueEncoding === void 0)
+    return false;
+  return payload.piiValueEncoding !== PII_VALUE_ENCODING;
+}
+function payloadRequiresUsablePiiWire(payload) {
+  if (!payload)
+    return false;
+  if (hasExplicitInvalidPiiEncoding(payload))
+    return true;
+  if (hasMalformedPiiAttributes(payload))
+    return true;
+  if (piiAttributeKeysFromPayload(payload).length > 0)
+    return true;
+  return false;
+}
+function isExplicitPiiRequirementCleared(payload) {
+  if (!payload || payload.piiAttributes === void 0)
+    return false;
+  if (!Array.isArray(payload.piiAttributes))
+    return false;
+  if (payload.piiAttributes.length !== 0)
+    return false;
+  if (hasExplicitInvalidPiiEncoding(payload))
+    return false;
+  return true;
+}
+function piiWireOptionsFromPayload(payload) {
+  if (!payload)
+    return null;
+  if (hasExplicitInvalidPiiEncoding(payload))
+    return null;
+  if (hasMalformedPiiAttributes(payload))
+    return null;
+  const salt = typeof payload.piiSalt === "string" ? payload.piiSalt : "";
+  if (!salt)
+    return null;
+  const attrs = piiAttributeKeysFromPayload(payload);
+  return {
+    piiAttributes: attrs,
+    piiSalt: salt,
+    piiValueEncoding: PII_VALUE_ENCODING
+  };
+}
+function isPiiWireBroken(payload, resolved, previousPriorHadPiiAttrs = false) {
+  if (hasExplicitInvalidPiiEncoding(payload) || hasMalformedPiiAttributes(payload)) {
+    return true;
+  }
+  if (resolved) {
+    return false;
+  }
+  if (isExplicitPiiRequirementCleared(payload))
+    return false;
+  if (payloadRequiresUsablePiiWire(payload))
+    return true;
+  if (previousPriorHadPiiAttrs && payloadHasExplicitPiiFields(payload)) {
+    return true;
+  }
+  return false;
+}
+function resolvePiiWireForDelta(previous, action) {
+  if (!payloadHasExplicitPiiFields(action)) {
+    return previous;
+  }
+  const merged = {
+    piiSalt: action.piiSalt !== void 0 ? action.piiSalt : previous?.piiSalt,
+    piiAttributes: action.piiAttributes !== void 0 ? action.piiAttributes : previous?.piiAttributes,
+    piiValueEncoding: action.piiValueEncoding !== void 0 ? action.piiValueEncoding : previous?.piiValueEncoding
+  };
+  return piiWireOptionsFromPayload(merged);
+}
+function applyPiiHashToFlatContext(context, options, mode) {
+  if (!options || !options.piiSalt || !options.piiAttributes.length || options.piiValueEncoding !== PII_VALUE_ENCODING) {
+    return context;
+  }
+  if (mode?.alreadyHashed) {
+    return context;
+  }
+  let changed = false;
+  const out = { ...context };
+  for (const [key2, value] of Object.entries(context)) {
+    if (!isPiiAttribute(key2, options.piiAttributes))
+      continue;
+    if (typeof value === "string") {
+      out[key2] = hashPiiValue(value, options.piiSalt);
+      changed = true;
+      continue;
+    }
+    if (Array.isArray(value)) {
+      let arrayChanged = false;
+      const next = value.map((entry) => {
+        if (typeof entry !== "string")
+          return entry;
+        arrayChanged = true;
+        return hashPiiValue(entry, options.piiSalt);
+      });
+      if (arrayChanged) {
+        out[key2] = next;
+        changed = true;
+      }
+    }
+  }
+  return changed ? out : context;
 }
 function createEmptyRulesState() {
   return {
@@ -41878,7 +42228,9 @@ function createEmptyRulesState() {
     flags: /* @__PURE__ */ new Map(),
     segments: /* @__PURE__ */ new Map(),
     ready: false,
-    needsFullConfig: true
+    needsFullConfig: true,
+    piiWire: null,
+    piiWireBroken: false
   };
 }
 function cloneState(state) {
@@ -41888,7 +42240,13 @@ function cloneState(state) {
     flags: new Map(state.flags),
     segments: new Map(state.segments),
     ready: state.ready,
-    needsFullConfig: state.needsFullConfig
+    needsFullConfig: state.needsFullConfig,
+    piiWire: state.piiWire ? {
+      piiAttributes: [...state.piiWire.piiAttributes],
+      piiSalt: state.piiWire.piiSalt,
+      piiValueEncoding: state.piiWire.piiValueEncoding
+    } : null,
+    piiWireBroken: state.piiWireBroken
   };
 }
 function segmentsFromRecord(record) {
@@ -41915,13 +42273,18 @@ function hydrateFromFull(action) {
     if (flag?.key)
       flags.set(flag.key, flag);
   }
+  const piiWire = piiWireOptionsFromPayload(action);
+  const piiWireBroken = isPiiWireBroken(action, piiWire, false);
   return {
     version: action.version,
     expiresAt: action.expiresAt,
     flags,
     segments: segmentsFromRecord(action.segments),
-    ready: true,
-    needsFullConfig: false
+    // Usable rules, but PII metadata must be valid when hashing is required.
+    ready: !piiWireBroken,
+    needsFullConfig: piiWireBroken,
+    piiWire,
+    piiWireBroken
   };
 }
 function applyPatch(state, action) {
@@ -41933,13 +42296,20 @@ function applyPatch(state, action) {
     if (flag?.key)
       flags.set(flag.key, flag);
   }
+  const nextPii = resolvePiiWireForDelta(state.piiWire, action);
+  const priorHadPiiAttrs = (state.piiWire?.piiAttributes.length ?? 0) > 0 || state.piiWireBroken;
+  const computedBroken = isPiiWireBroken(action, nextPii, priorHadPiiAttrs);
+  const recoveredWithRequiredAttrs = !!nextPii && nextPii.piiAttributes.length > 0;
+  const piiWireBroken = isExplicitPiiRequirementCleared(action) ? false : recoveredWithRequiredAttrs ? false : computedBroken || state.piiWireBroken;
   return {
     version: action.toVersion,
     expiresAt: typeof action.expiresAt === "number" ? action.expiresAt : state.expiresAt,
     flags,
     segments: applySegmentUpserts(state.segments, action.segments),
-    ready: true,
-    needsFullConfig: false
+    ready: !piiWireBroken,
+    needsFullConfig: piiWireBroken,
+    piiWire: nextPii,
+    piiWireBroken
   };
 }
 function reduceRules(state, action, now = Date.now()) {
@@ -41959,8 +42329,8 @@ function reduceRules(state, action, now = Date.now()) {
           ...cloneState(state),
           version: state.version,
           expiresAt: action.expiresAt,
-          ready: true,
-          needsFullConfig: state.flags.size === 0 || versionMismatch ? true : state.needsFullConfig
+          ready: !state.piiWireBroken,
+          needsFullConfig: state.piiWireBroken || state.flags.size === 0 || versionMismatch ? true : state.needsFullConfig
         }
       };
     }
@@ -42016,8 +42386,8 @@ function reduceRules(state, action, now = Date.now()) {
           ...current,
           version: action.toVersion,
           expiresAt: typeof action.expiresAt === "number" ? action.expiresAt : current.expiresAt,
-          ready: true,
-          needsFullConfig: false
+          ready: !current.piiWireBroken,
+          needsFullConfig: current.piiWireBroken
         }
       };
     }
@@ -42040,9 +42410,12 @@ class RulesStore {
     return this.state;
   }
   /**
-   * Fail-closed readiness: lease not expired and store marked ready.
+   * Fail-closed readiness: lease not expired, store marked ready, and PII
+   * wire metadata usable when hashing is required.
    */
   isReady(now = Date.now()) {
+    if (this.state.piiWireBroken)
+      return false;
     if (!this.state.ready)
       return false;
     if (!this.state.expiresAt)
@@ -42116,11 +42489,19 @@ class RulesStore {
     this.state.segments.forEach((segment, id) => {
       segments[id] = segment;
     });
+    const pii = this.state.piiWire;
     return {
       version: this.state.version,
       expiresAt: this.state.expiresAt,
       flags: Array.from(this.state.flags.values()),
-      segments
+      segments,
+      ...pii ? {
+        piiAttributes: [...pii.piiAttributes],
+        piiSalt: pii.piiSalt,
+        piiValueEncoding: pii.piiValueEncoding
+      } : {},
+      // Persist fail-closed even when piiWire is null (unusable salt/encoding).
+      ...this.state.piiWireBroken ? { piiWireBroken: true } : {}
     };
   }
   hydrateFromSnapshot(snapshot, now = Date.now()) {
@@ -42130,13 +42511,17 @@ class RulesStore {
         flags.set(flag.key, flag);
     }
     const expired = isConfigPayloadExpired(snapshot.expiresAt, now);
+    const piiWire = piiWireOptionsFromPayload(snapshot);
+    const piiWireBroken = snapshot.piiWireBroken === true || isPiiWireBroken(snapshot, piiWire, false);
     this.state = {
       version: snapshot.version,
       expiresAt: snapshot.expiresAt,
       flags,
       segments: segmentsFromRecord(snapshot.segments),
-      ready: !expired && flags.size > 0,
-      needsFullConfig: expired || flags.size === 0
+      ready: !expired && flags.size > 0 && !piiWireBroken,
+      needsFullConfig: expired || flags.size === 0 || piiWireBroken,
+      piiWire,
+      piiWireBroken
     };
   }
 }
@@ -42338,7 +42723,7 @@ function flattenEvaluationContext(context) {
 function toComparableString(value) {
   if (value === null || value === void 0)
     return "";
-  return String(value);
+  return String(value).trim().toLowerCase();
 }
 function toComparableArray(value) {
   if (Array.isArray(value)) {
@@ -42900,8 +43285,13 @@ function prepareContextForEvaluator(context) {
   }
   return context;
 }
-function evaluateSdkFlag(flag, context, segments) {
-  const evalContext = prepareContextForEvaluator(context);
+function prepareContextForLocalEval(context, pii) {
+  const prepared = prepareContextForEvaluator(context);
+  const flat = flattenEvaluationContext(prepared);
+  return applyPiiHashToFlatContext(flat, pii);
+}
+function evaluateSdkFlag(flag, context, segments, pii) {
+  const evalContext = prepareContextForLocalEval(context, pii);
   const variationsById = {};
   for (const v of flag.variations || []) {
     if (v?.id)
@@ -42961,7 +43351,7 @@ function evaluateSdkFlag(flag, context, segments) {
 }
 function evaluateAllSdkFlags(flags, context, segments, options) {
   const list = flags instanceof Map ? Array.from(flags.values()) : flags;
-  const prepared = prepareContextForEvaluator(context);
+  const prepared = prepareContextForLocalEval(context, options?.pii);
   const out = {};
   for (const flag of list) {
     if (!flag?.key)
@@ -42970,7 +43360,7 @@ function evaluateAllSdkFlags(flags, context, segments, options) {
       out[flag.key] = coerceType(flag.default_value, flag.type);
       continue;
     }
-    out[flag.key] = evaluateSdkFlag(flag, prepared, segments);
+    out[flag.key] = evaluateSdkFlag(flag, prepared, segments, null);
   }
   return out;
 }
@@ -43003,7 +43393,7 @@ function getDefaultEndpoints(env2) {
 function sdkError(message, code2, extra) {
   return Object.assign(new Error(message), { code: code2, ...extra });
 }
-class FlagClient {
+const _FlagClient = class _FlagClient2 {
   /**
    * Creates a new FlagClient instance.
    * @param options - Configuration options for the client.
@@ -43023,6 +43413,7 @@ class FlagClient {
     this.shareHub = null;
     this.rulesStore = null;
     this.leaseRenewInFlight = false;
+    this.leaseRenewTimer = null;
     this.apiKey = options.apiKey;
     this.enableOfflineCache = options.enableOfflineCache ?? true;
     this.persistContext = options.persistContext ?? false;
@@ -43036,14 +43427,6 @@ class FlagClient {
     const sseIsCustom = Boolean(options.sseEndpoint) && options.sseEndpoint !== defaultEndpoints.sse;
     const restIsCustom = Boolean(options.restEndpoint) && options.restEndpoint !== defaultEndpoints.rest;
     this.flagsApiEndpoint = options.flagsEndpoint ?? (sseIsCustom && !restIsCustom ? this.sseEndpoint : flagsBaseFromRestEndpoint(this.restEndpoint));
-    this.cacheAdapter = options.cacheAdapter ?? {
-      loadFlags: loadCachedFlags$1,
-      saveFlags: saveCachedFlags$1,
-      loadContext: loadCachedContext$1,
-      saveContext: saveCachedContext$1,
-      loadRulesSnapshot: loadCachedRulesSnapshot$1,
-      saveRulesSnapshot: saveCachedRulesSnapshot$1
-    };
     this.context = toJsonCloneable(options.context || {});
     this.rawFlags = options.rawFlags ?? {};
     this.previewMode = options.previewMode || false;
@@ -43051,11 +43434,24 @@ class FlagClient {
     this.env = options.env;
     this.enableFlagmint = options.enableFlagmint ?? true;
     this.configSync = options.configSync ?? false;
-    this.shareConnection = options.shareConnection ?? (this.configSync ? false : isConnectionSharingAvailable());
+    logger.setup({ debugLog: options.debugLog });
+    const defaultAdapter = {
+      loadFlags: loadCachedFlags$1,
+      saveFlags: saveCachedFlags$1,
+      loadContext: loadCachedContext$1,
+      saveContext: saveCachedContext$1,
+      loadRulesSnapshot: loadCachedRulesSnapshot$1,
+      saveRulesSnapshot: saveCachedRulesSnapshot$1
+    };
+    const baseAdapter = options.cacheAdapter ?? defaultAdapter;
+    this.cacheAdapter = this.configSync ? {
+      ...baseAdapter,
+      saveFlags: () => void 0
+    } : baseAdapter;
+    this.shareConnection = options.shareConnection ?? isConnectionSharingAvailable();
     if (this.configSync) {
       this.rulesStore = new RulesStore();
     }
-    logger.setup({ debugLog: options.debugLog });
     if (this.previewMode && this.rawFlags && Object.keys(this.rawFlags).length > 0) {
       this.flags = this.evaluateLocally(this.rawFlags, this.context);
       this.readyPromise = Promise.resolve();
@@ -43101,10 +43497,13 @@ class FlagClient {
           this.context = stored;
       }
       let hydratedRules = false;
-      if (this.configSync && this.rulesStore && this.enableOfflineCache) {
-        hydratedRules = await this.hydrateRulesFromCache();
+      if (this.configSync && this.rulesStore) {
+        clearCachedFlags$1(this.apiKey);
+        if (this.enableOfflineCache) {
+          hydratedRules = await this.hydrateRulesFromCache();
+        }
       }
-      if (this.enableOfflineCache && !hydratedRules) {
+      if (this.enableOfflineCache && !this.configSync && !hydratedRules) {
         const cached = await Promise.resolve(
           this.cacheAdapter.loadFlags(this.apiKey, this.cacheTTL)
         );
@@ -43119,7 +43518,7 @@ class FlagClient {
         return;
       }
       await this.setupTransport(options);
-      this.shareHub?.broadcastFlags(this.flags);
+      this.broadcastShareSnapshot();
       this.isInitialized = true;
       this.resolveReady();
     } catch (err) {
@@ -43159,19 +43558,26 @@ class FlagClient {
    * @returns true when this document is a follower and should skip opening a stream.
    */
   async joinConnectionShare(options) {
-    if (!this.shareConnection || options.transport) {
+    if (!this.shareConnection) {
+      return false;
+    }
+    if (options.transport && !options.share) {
       return false;
     }
     if (!options.share && !isConnectionSharingAvailable()) {
       return false;
     }
-    this.shareHub = new ConnectionShareHub(this.apiKey, options.share);
+    const shareMode = this.configSync ? "rules" : "evaluated";
+    this.shareHub = new ConnectionShareHub(this.apiKey, {
+      ...options.share,
+      mode: shareMode
+    });
     this.shareHub.onPromote(async () => {
       logger.log("[FlagClient] Share leader departed. Promoting this document to hold the stream.");
       try {
         await this.setupTransport(options);
         this.attachShareLeader();
-        this.shareHub?.broadcastFlags(this.flags);
+        this.broadcastShareSnapshot();
       } catch (err) {
         const error2 = err instanceof Error ? err : new Error(String(err));
         logger.error("[FlagClient] Promotion to share leader failed:", error2);
@@ -43180,7 +43586,12 @@ class FlagClient {
     });
     const role = await this.shareHub.join();
     if (role === "follower") {
-      logger.log("[FlagClient] Following an existing Flagmint stream in another same-origin document.");
+      logger.log(
+        shareMode === "rules" ? "[FlagClient] Following shared config-sync rules from another same-origin document." : "[FlagClient] Following an existing Flagmint stream in another same-origin document."
+      );
+      if (shareMode === "rules") {
+        this.attachRulesShareFollower();
+      }
       this.transport = this.shareHub.createFollowerTransport();
       this.bindTransport(this.transport);
       await this.transport.init();
@@ -43189,8 +43600,26 @@ class FlagClient {
     this.attachShareLeader();
     return false;
   }
+  /**
+   * Leader: rules mode listens for follower lease-renew requests; evaluated
+   * mode wires context RPC onto the shared stream.
+   */
   attachShareLeader() {
-    this.shareHub?.setLeaderContextHandler(async (context, options) => {
+    if (!this.shareHub)
+      return;
+    if (this.shareHub.shareMode === "rules") {
+      this.shareHub.setLeaderLeaseRenewHandler(() => {
+        if (!this.transport?.requestReconnect)
+          return;
+        logger.log(
+          "[FlagClient] Rules-share follower requested config-sync lease renew — reconnecting."
+        );
+        this.leaseRenewInFlight = true;
+        this.transport.requestReconnect("lease_renew_requested");
+      });
+      return;
+    }
+    this.shareHub.setLeaderContextHandler(async (context, options) => {
       const mergedContext = toJsonCloneable({ ...this.context, ...context });
       if (options?.persist === true) {
         this.context = mergedContext;
@@ -43199,15 +43628,80 @@ class FlagClient {
         }
       }
       if (!this.transport || typeof this.transport.fetchFlags !== "function") {
-        if (this.configSync && this.rulesStore) {
-          return this.evaluateFromRulesStore(mergedContext);
-        }
         return this.flags;
       }
       return this.transport.fetchFlags(mergedContext, {
         persist: options?.persist === true
       });
     });
+  }
+  /**
+   * Schedule SSE reconnect near lease `expiresAt` so an idle leader still renews
+   * (followers have no stream of their own under rules share).
+   *
+   * @param expiresAt Lease end from the last verified config-sync payload
+   */
+  scheduleConfigSyncLeaseRenew(expiresAt) {
+    if (this.leaseRenewTimer) {
+      clearTimeout(this.leaseRenewTimer);
+      this.leaseRenewTimer = null;
+    }
+    if (this.shareHub?.currentRole === "follower")
+      return;
+    if (!Number.isFinite(expiresAt) || expiresAt <= 0)
+      return;
+    const delayMs = Math.max(
+      0,
+      expiresAt - Date.now() - _FlagClient2.LEASE_RENEW_SKEW_MS
+    );
+    this.leaseRenewTimer = setTimeout(() => {
+      this.leaseRenewTimer = null;
+      if (!this.transport?.requestReconnect)
+        return;
+      if (this.leaseRenewInFlight)
+        return;
+      this.leaseRenewInFlight = true;
+      logger.log(
+        "[FlagClient] Config-sync lease window ending — reconnecting for renew."
+      );
+      this.transport.requestReconnect("lease_expired");
+    }, delayMs);
+  }
+  /**
+   * Follower hooks for rules-only share: hydrate rules locally and evaluate
+   * with this document's context (never the leader's).
+   */
+  attachRulesShareFollower() {
+    if (!this.shareHub || !this.rulesStore)
+      return;
+    this.shareHub.setFollowerRulesApply((payload) => {
+      this.rulesStore.hydrateFromSnapshot(payload.snapshot);
+      this.leaseRenewInFlight = false;
+      if (payload.analytics) {
+        this.updateAnalytics(payload.analytics);
+      }
+      const flags = this.evaluateFromRulesStore();
+      this.updateFlags(flags, true);
+      return flags;
+    });
+    this.shareHub.setFollowerLocalEval((context) => {
+      return this.evaluateFromRulesStore(context);
+    });
+  }
+  /**
+   * Leader: push the right snapshot type to followers after flags/rules change.
+   */
+  broadcastShareSnapshot() {
+    if (!this.shareHub || this.shareHub.currentRole !== "leader")
+      return;
+    if (this.shareHub.shareMode === "rules" && this.rulesStore) {
+      const snapshot = this.rulesStore.toSnapshot();
+      if (snapshot.flags.length === 0)
+        return;
+      this.shareHub.broadcastRules(snapshot, this.analyticsMapFromRulesStore());
+      return;
+    }
+    this.shareHub.broadcastFlags(this.flags);
   }
   /**
   * Creates and initializes the transport layer used to receive feature flags
@@ -43346,14 +43840,16 @@ class FlagClient {
    */
   updateFlags(newFlags, fromShare = false) {
     this.flags = newFlags;
-    if (this.enableOfflineCache) {
+    if (this.configSync) {
+      clearCachedFlags$1(this.apiKey);
+    } else if (this.enableOfflineCache) {
       void Promise.resolve(
         this.cacheAdapter.saveFlags(this.apiKey, newFlags)
       );
     }
     this.notifySubscribers();
     if (!fromShare) {
-      this.shareHub?.broadcastFlags(newFlags);
+      this.broadcastShareSnapshot();
     }
   }
   /**
@@ -43415,7 +43911,8 @@ class FlagClient {
         value = evaluateSdkFlag(
           flag,
           this.context,
-          this.rulesStore.getState().segments
+          this.rulesStore.getState().segments,
+          this.rulesStore.getState().piiWire
         ) ?? fallback;
       }
     } else {
@@ -43560,6 +44057,10 @@ class FlagClient {
   destroy() {
     if (this.refreshIntervalId) {
       clearInterval(this.refreshIntervalId);
+    }
+    if (this.leaseRenewTimer) {
+      clearTimeout(this.leaseRenewTimer);
+      this.leaseRenewTimer = null;
     }
     if (this.evaluationReportTimer) {
       clearTimeout(this.evaluationReportTimer);
@@ -43878,6 +44379,7 @@ class FlagClient {
     if (result.ok && (eventName === "lease" || eventName === "fullConfig")) {
       this.leaseRenewInFlight = false;
     }
+    this.scheduleConfigSyncLeaseRenew(store.getState().expiresAt);
     if (eventName === "lease" && store.getState().flags.size === 0 && store.getState().needsFullConfig) {
       return { publish: false };
     }
@@ -43895,7 +44397,7 @@ class FlagClient {
       state.flags,
       context ?? this.context,
       state.segments,
-      { failClosedDefaultsOnly: failClosed }
+      { failClosedDefaultsOnly: failClosed, pii: state.piiWire }
     );
   }
   analyticsMapFromRulesStore() {
@@ -43907,7 +44409,9 @@ class FlagClient {
     }
     return map;
   }
-}
+};
+_FlagClient.LEASE_RENEW_SKEW_MS = 5e3;
+let FlagClient = _FlagClient;
 function getFlagsKey(apiKey) {
   return `flagmint_${apiKey}_flags`;
 }
@@ -43923,12 +44427,27 @@ function parseRulesSnapshot(raw) {
     if (!parsed || typeof parsed.version !== "number" || typeof parsed.expiresAt !== "number" || !Array.isArray(parsed.flags) || typeof parsed.segments !== "object" || parsed.segments === null) {
       return null;
     }
-    return {
+    const snapshot = {
       version: parsed.version,
       expiresAt: parsed.expiresAt,
       flags: parsed.flags,
       segments: parsed.segments || {}
     };
+    if (Array.isArray(parsed.piiAttributes)) {
+      snapshot.piiAttributes = parsed.piiAttributes.filter(
+        (attr) => typeof attr === "string"
+      );
+    }
+    if (typeof parsed.piiSalt === "string") {
+      snapshot.piiSalt = parsed.piiSalt;
+    }
+    if (typeof parsed.piiValueEncoding === "string") {
+      snapshot.piiValueEncoding = parsed.piiValueEncoding;
+    }
+    if (parsed.piiWireBroken === true) {
+      snapshot.piiWireBroken = true;
+    }
+    return snapshot;
   } catch {
     return null;
   }
@@ -43957,6 +44476,19 @@ async function saveCachedFlags(apiKey, data) {
     throw new Error("Async storage not set");
   try {
     await storage.setItem(getFlagsKey(apiKey), JSON.stringify({ ts: Date.now(), data }));
+  } catch {
+  }
+}
+async function clearCachedFlags(apiKey) {
+  if (!storage)
+    throw new Error("Async storage not set");
+  const key2 = getFlagsKey(apiKey);
+  try {
+    if (typeof storage.removeItem === "function") {
+      await storage.removeItem(key2);
+      return;
+    }
+    await storage.setItem(key2, JSON.stringify({ ts: 0, data: {} }));
   } catch {
   }
 }
@@ -44008,6 +44540,7 @@ async function clearCachedRulesSnapshot(apiKey) {
 }
 const cacheHelper_async = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
   __proto__: null,
+  clearCachedFlags,
   clearCachedRulesSnapshot,
   loadCachedContext,
   loadCachedFlags,
@@ -44024,6 +44557,7 @@ exports.FlagClient = FlagClient;
 exports.LongPollingTransport = LongPollingTransport;
 exports.RulesStore = RulesStore;
 exports.SseTransport = SseTransport;
+exports.applyPiiHashToFlatContext = applyPiiHashToFlatContext;
 exports.applyRolloutStrategy = applyRolloutStrategy;
 exports.asyncCache = cacheHelper_async;
 exports.canonicalizeForSigning = canonicalizeForSigning;
@@ -44041,11 +44575,13 @@ exports.evaluateSdkFlag = evaluateSdkFlag;
 exports.flattenEvaluationContext = flattenEvaluationContext;
 exports.generateAslClientKeyPair = generateAslClientKeyPair;
 exports.hashPercent = hashPercent;
+exports.hashPiiValue = hashPiiValue;
 exports.hashToPercentage = hashToPercentage;
 exports.isConfigPayloadExpired = isConfigPayloadExpired;
 exports.isInSegment = isInSegment;
 exports.performAslHandshake = performAslHandshake;
 exports.pickVariant = pickVariant;
+exports.prepareContextForLocalEval = prepareContextForLocalEval;
 exports.reduceRules = reduceRules;
 exports.signConfigPayload = signConfigPayload;
 exports.stringHash = stringHash;

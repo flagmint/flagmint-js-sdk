@@ -10,12 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Config-sync offline cache (#25).** With `configSync: true`, do not load or save `flagmint_<apiKey>_flags` (evaluated answers keyed only by API key → last tab wins). On init, delete any leftover entry. Persist **rules** only (`flagmint_<apiKey>_rules`).
+- **Local evaluation after reload.** Rules cached in the browser no longer lose PII metadata (`piiAttributes`, `piiSalt`, encoding, fail-closed flag). Email / other hashed targeting keeps working after a refresh instead of waiting for a fresh full config download.
 
-- **Rules localCache PII fields.** `loadCachedRulesSnapshot` / `parseRulesSnapshot` no longer strip `piiAttributes`, `piiSalt`, `piiValueEncoding`, or `piiWireBroken`. Hydrate → re-persist was rewriting storage without PII, so email targeting failed after reload until a fresh `fullConfig`.
+- **Cross-tab flag answers under config sync.** With local evaluation on, the SDK no longer stores evaluated flag values under a shared API-key key (so one tab’s answers cannot overwrite another’s). Only the signed rules snapshot is cached; each tab evaluates with its own context.
 
-- **Rules-only connection sharing for config sync (#24).** With `configSync: true` and `shareConnection` on, same-origin tabs/iframes elect one SSE leader and broadcast **verified rules snapshots** over a dedicated channel (`flagmint-share-rules:<apiKey>`). Followers hydrate locally and evaluate with **their own** context — no context RPC onto the leader stream. Server-eval sharing (`configSync` off) is unchanged (still shares evaluated maps + context RPC on `flagmint-share:<apiKey>`).
-- **Lease renew under rules share.** Followers’ `requestReconnect` posts `lease-renew-request` so the leader reconnects SSE; the leader also schedules renew ~5s before `expiresAt` (server only issues a lease on connect — no mid-stream renew push).
+### Added
+
+- **Rules-only connection sharing.** With `configSync` and `shareConnection` enabled, same-origin tabs elect one stream leader and share verified rules. Followers evaluate locally with their own context. Server-evaluation sharing (config sync off) is unchanged.
+
+- **Smarter lease renewals for shared rules.** Followers asking to reconnect tell the leader to renew; the leader also reconnects shortly before the lease expires so followers stay warm when the server only issues leases on connect.
 
 
 ## [2.2.3-rc.1] — 2026-10-18

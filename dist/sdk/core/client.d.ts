@@ -16,7 +16,8 @@ export interface FlagClientOptions<C extends Record<string, any> = Record<string
      * Performs X25519 ECDH on ASL handshake and derives a session MAC key used
      * to verify signed `lease` / `fullConfig` / `delta` payloads.
      * Default false — keeps the legacy evaluated-flags stream.
-     * When true, `shareConnection` defaults to false (rules are not shared across tabs yet).
+     * When true and `shareConnection` is on, tabs share **rules** only (one SSE);
+     * each document keeps its own context and evaluates locally.
      */
     configSync?: boolean;
     /**
@@ -68,6 +69,8 @@ export interface FlagClientOptions<C extends Record<string, any> = Record<string
      * leader and forward updateContext() to it. Do not enable this when two clients
      * must evaluate different contexts at the same time on one page, or when the
      * origin hosts untrusted documents that should not steer or read this stream.
+     *
+     * With `configSync`, sharing uses rules-only mode (not evaluated maps / context RPC).
      */
     shareConnection?: boolean;
     /**
@@ -119,6 +122,10 @@ export declare class FlagClient<T = unknown, C extends Record<string, any> = Rec
     private rulesStore;
     /** Avoid stacking reconnects when many getFlag calls hit an expired lease. */
     private leaseRenewInFlight;
+    /** Leader (and solo) timer to reconnect near config-sync `expiresAt`. */
+    private leaseRenewTimer;
+    /** Reconnect slightly before expiresAt to limit fail-closed gaps / clock skew. */
+    private static readonly LEASE_RENEW_SKEW_MS;
     /**
      * Creates a new FlagClient instance.
      * @param options - Configuration options for the client.
@@ -133,7 +140,27 @@ export declare class FlagClient<T = unknown, C extends Record<string, any> = Rec
      * @returns true when this document is a follower and should skip opening a stream.
      */
     private joinConnectionShare;
+    /**
+     * Leader: rules mode listens for follower lease-renew requests; evaluated
+     * mode wires context RPC onto the shared stream.
+     */
     private attachShareLeader;
+    /**
+     * Schedule SSE reconnect near lease `expiresAt` so an idle leader still renews
+     * (followers have no stream of their own under rules share).
+     *
+     * @param expiresAt Lease end from the last verified config-sync payload
+     */
+    private scheduleConfigSyncLeaseRenew;
+    /**
+     * Follower hooks for rules-only share: hydrate rules locally and evaluate
+     * with this document's context (never the leader's).
+     */
+    private attachRulesShareFollower;
+    /**
+     * Leader: push the right snapshot type to followers after flags/rules change.
+     */
+    private broadcastShareSnapshot;
     /**
    * Creates and initializes the transport layer used to receive feature flags
    * updates from the Flagmint platform.
