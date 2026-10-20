@@ -4,11 +4,13 @@ Platform-agnostic helpers for caching **evaluated flags**, **user context**, and
 
 | Kind | Storage key | Notes |
 |------|-------------|--------|
-| Flags | `flagmint_<apiKey>_flags` | Wall-clock TTL on load |
+| Flags | `flagmint_<apiKey>_flags` | Wall-clock TTL on load — **server-eval** path |
 | Context | `flagmint_<apiKey>_context` | No TTL |
 | Rules (config-sync) | `flagmint_<apiKey>_rules` | Lease `expiresAt` gates reuse — not a wall-clock TTL |
 
 `FlagClient` wires these by default when `enableOfflineCache` is on (`loadRulesSnapshot` / `saveRulesSnapshot` for config-sync).
+
+**`FlagClient` + `configSync`:** does **not** load or save evaluated flags via the adapter (`saveFlags` is a no-op; leftover `*_flags` keys are cleared). Only rules snapshots are persisted. The helpers below can still read/write `*_flags` if you call them directly — that path is for **server-eval** or custom use, not for `FlagClient` under config sync.
 
 ---
 
@@ -44,7 +46,9 @@ The sync `cacheHelper` module supports:
 
 ## Default Sync Usage (Browser)
 
-`localStorage` is used automatically — no setup required:
+`localStorage` is used automatically — no setup required.
+
+### Server-eval (evaluated flags)
 
 ```ts
 import {
@@ -52,8 +56,6 @@ import {
   saveCachedFlags,
   loadCachedContext,
   saveCachedContext,
-  loadCachedRulesSnapshot,
-  saveCachedRulesSnapshot,
 } from './cacheHelper';
 
 const flags = loadCachedFlags('your-api-key', 10_000); // 10 sec TTL
@@ -61,13 +63,23 @@ saveCachedFlags('your-api-key', { featureA: true });
 
 const context = loadCachedContext('your-api-key');
 saveCachedContext('your-api-key', { user_id: 'abc123' });
+```
 
-// configSync localCache (FlagClient does this for you when offline cache is on)
+### Config sync (rules only)
+
+`FlagClient` with `configSync: true` uses these when offline cache is on — not `*_flags`:
+
+```ts
+import {
+  loadCachedRulesSnapshot,
+  saveCachedRulesSnapshot,
+} from './cacheHelper';
+
 const rules = loadCachedRulesSnapshot('your-api-key');
 if (rules) {
   // hydrate RulesStore, or let FlagClient do it on boot
+  saveCachedRulesSnapshot('your-api-key', rules);
 }
-saveCachedRulesSnapshot('your-api-key', rules!);
 ```
 
 ---
