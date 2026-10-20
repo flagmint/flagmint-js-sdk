@@ -1,6 +1,6 @@
 # Flagmint JavaScript SDK
 
-> A framework-agnostic JavaScript SDK for evaluating and streaming feature flags in browsers and Node.js.
+> Flagmint JS SDK is a lightweight, framework-agnostic toolkit designed to stream and evaluate feature flags in real-time. Whether running client-side in the browser or server-side in Node.js, it delivers sub-millisecond local evaluations via Server-Sent Events (SSE) without bloating your network overhead.
 
 ![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue)
 ![Node](https://img.shields.io/badge/Node.js-18%2B-green)
@@ -8,12 +8,13 @@
 
 ## Features
 
-- Framework agnostic (React, Vue, Angular, vanilla JS, Node.js)
-- Real-time flag updates over Server-Sent Events (SSE)
-- Automatic reconnection with a fresh single-use session token
-- Same-origin iframe/tab connection sharing (one stream per API key)
-- Built-in localStorage cache, with pluggable adapters for Node
-- `getFlag()` is always local — no network on the read path
+- Framework agnostic — React, Vue, Angular, Next.js, Express, Fastify, or vanilla JS/TS  
+- Real-time SSE — flag/rule updates over Server-Sent Events (not “sub-millisecond updates”)  
+- Zero network on read — `getFlag()` reads a local in-memory snapshot  
+- Local evaluation (`configSync`) — sync signed rules, evaluate in-process per context (no evaluate RPC on each read)  
+- Connection sharing — same-origin tabs/iframes share one SSE stream per API key (browser)  
+- Offline cache — bootstrap from cache when the network drops  
+- Safe init — `ready()` never throws; errors go through `onError`
 
 ## Release notes
 
