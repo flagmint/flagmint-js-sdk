@@ -47,7 +47,8 @@ export interface FlagClientOptions<C extends Record<string, any> = Record<string
    * Performs X25519 ECDH on ASL handshake and derives a session MAC key used
    * to verify signed `lease` / `fullConfig` / `delta` payloads.
    * Default false — keeps the legacy evaluated-flags stream.
-   * When true, `shareConnection` defaults to false (rules are not shared across tabs yet).
+   * When true and `shareConnection` is on, tabs share **rules** only (one SSE);
+   * each document keeps its own context and evaluates locally.
    */
   configSync?: boolean;
   /**
@@ -99,6 +100,8 @@ export interface FlagClientOptions<C extends Record<string, any> = Record<string
    * leader and forward updateContext() to it. Do not enable this when two clients
    * must evaluate different contexts at the same time on one page, or when the
    * origin hosts untrusted documents that should not steer or read this stream.
+   *
+   * With `configSync`, sharing uses rules-only mode (not evaluated maps / context RPC).
    */
   shareConnection?: boolean;
   /**
@@ -202,6 +205,10 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
   private rulesStore: RulesStore | null = null;
   /** Avoid stacking reconnects when many getFlag calls hit an expired lease. */
   private leaseRenewInFlight = false;
+  /** Leader (and solo) timer to reconnect near config-sync `expiresAt`. */
+  private leaseRenewTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Reconnect slightly before expiresAt to limit fail-closed gaps / clock skew. */
+  private static readonly LEASE_RENEW_SKEW_MS = 5_000;
 
   /**
    * Creates a new FlagClient instance.
@@ -227,15 +234,6 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
       (sseIsCustom && !restIsCustom
         ? this.sseEndpoint
         : flagsBaseFromRestEndpoint(this.restEndpoint));
-    this.cacheAdapter = options.cacheAdapter ?? {
-      loadFlags: syncCache.loadCachedFlags,
-      saveFlags: syncCache.saveCachedFlags,
-      loadContext: syncCache.loadCachedContext,
-      saveContext: syncCache.saveCachedContext,
-      loadRulesSnapshot: syncCache.loadCachedRulesSnapshot,
-      saveRulesSnapshot: syncCache.saveCachedRulesSnapshot,
-    };
-
     this.context = toJsonCloneable((options.context || ({} as C)));
     this.rawFlags = options.rawFlags ?? {};
     this.previewMode = options.previewMode || false;
@@ -243,16 +241,33 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
     this.env = options.env;
     this.enableFlagmint = options.enableFlagmint ?? true;
     this.configSync = options.configSync ?? false;
-    // Config-sync local eval needs a rules store + ECDH on this document.
-    // Connection sharing is off by default until rules snapshots are shared.
+    logger.setup({ debugLog: options.debugLog });
+
+    const defaultAdapter: CacheAdapter<C> = {
+      loadFlags: syncCache.loadCachedFlags,
+      saveFlags: syncCache.saveCachedFlags,
+      loadContext: syncCache.loadCachedContext,
+      saveContext: syncCache.saveCachedContext,
+      loadRulesSnapshot: syncCache.loadCachedRulesSnapshot,
+      saveRulesSnapshot: syncCache.saveCachedRulesSnapshot,
+    };
+    const baseAdapter = options.cacheAdapter ?? defaultAdapter;
+    // Config-sync: never persist evaluated maps (API-key key = last tab wins),
+    // even if a custom adapter or future call site forgets the updateFlags guard.
+    this.cacheAdapter = this.configSync
+      ? {
+          ...baseAdapter,
+          saveFlags: () => undefined,
+        }
+      : baseAdapter;
+
+    // Same default as server eval: share when BroadcastChannel exists.
+    // Config-sync uses rules-only share mode (see joinConnectionShare).
     this.shareConnection =
-      options.shareConnection ??
-      (this.configSync ? false : isConnectionSharingAvailable());
+      options.shareConnection ?? isConnectionSharingAvailable();
     if (this.configSync) {
       this.rulesStore = new RulesStore();
     }
-
-    logger.setup({ debugLog: options.debugLog });
 
     // Local-only evaluation
     if (this.previewMode && this.rawFlags && Object.keys(this.rawFlags).length > 0) {
@@ -307,10 +322,15 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
 
       // B) Config-sync: rules localCache only. Evaluated maps are per-context and
       // must not live in API-key-scoped storage (last tab would win across tabs).
+      // Always drop leftover `*_flags` even when offline cache is off — e.g. after
+      // switching from server-eval, or when shareConnection is false but tabs
+      // still share localStorage.
       let hydratedRules = false;
-      if (this.configSync && this.rulesStore && this.enableOfflineCache) {
+      if (this.configSync && this.rulesStore) {
         syncCache.clearCachedFlags(this.apiKey);
-        hydratedRules = await this.hydrateRulesFromCache();
+        if (this.enableOfflineCache) {
+          hydratedRules = await this.hydrateRulesFromCache();
+        }
       }
 
       // C) Cached evaluated flags (server-eval bootstrap / offline only)
@@ -333,7 +353,7 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
       }
 
       await this.setupTransport(options);
-      this.shareHub?.broadcastFlags(this.flags as Record<string, T>);
+      this.broadcastShareSnapshot();
 
       // E) Mark as initialized and resolve
       this.isInitialized = true;
@@ -384,20 +404,29 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
    * @returns true when this document is a follower and should skip opening a stream.
    */
   private async joinConnectionShare(options: FlagClientOptions<C>): Promise<boolean> {
-    if (!this.shareConnection || options.transport) {
+    if (!this.shareConnection) {
+      return false;
+    }
+    // Injected `transport` usually owns the stream alone. Still allow sharing
+    // when share hooks are provided (tests / custom channel + lock storage).
+    if (options.transport && !options.share) {
       return false;
     }
     if (!options.share && !isConnectionSharingAvailable()) {
       return false;
     }
 
-    this.shareHub = new ConnectionShareHub<C, T>(this.apiKey, options.share);
+    const shareMode = this.configSync ? 'rules' : 'evaluated';
+    this.shareHub = new ConnectionShareHub<C, T>(this.apiKey, {
+      ...options.share,
+      mode: shareMode,
+    });
     this.shareHub.onPromote(async () => {
       logger.log('[FlagClient] Share leader departed. Promoting this document to hold the stream.');
       try {
         await this.setupTransport(options);
         this.attachShareLeader();
-        this.shareHub?.broadcastFlags(this.flags as Record<string, T>);
+        this.broadcastShareSnapshot();
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
         logger.error('[FlagClient] Promotion to share leader failed:', error);
@@ -408,7 +437,14 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
     const role = await this.shareHub.join();
 
     if (role === 'follower') {
-      logger.log('[FlagClient] Following an existing Flagmint stream in another same-origin document.');
+      logger.log(
+        shareMode === 'rules'
+          ? '[FlagClient] Following shared config-sync rules from another same-origin document.'
+          : '[FlagClient] Following an existing Flagmint stream in another same-origin document.',
+      );
+      if (shareMode === 'rules') {
+        this.attachRulesShareFollower();
+      }
       this.transport = this.shareHub.createFollowerTransport();
       this.bindTransport(this.transport);
       await this.transport.init();
@@ -419,8 +455,26 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
     return false;
   }
 
+  /**
+   * Leader: rules mode listens for follower lease-renew requests; evaluated
+   * mode wires context RPC onto the shared stream.
+   */
   private attachShareLeader(): void {
-    this.shareHub?.setLeaderContextHandler(async (context, options) => {
+    if (!this.shareHub) return;
+
+    if (this.shareHub.shareMode === 'rules') {
+      this.shareHub.setLeaderLeaseRenewHandler(() => {
+        if (!this.transport?.requestReconnect) return;
+        logger.log(
+          '[FlagClient] Rules-share follower requested config-sync lease renew — reconnecting.',
+        );
+        this.leaseRenewInFlight = true;
+        this.transport.requestReconnect('lease_renew_requested');
+      });
+      return;
+    }
+
+    this.shareHub.setLeaderContextHandler(async (context, options) => {
       const mergedContext = toJsonCloneable({ ...this.context, ...context } as C);
       if (options?.persist === true) {
         this.context = mergedContext;
@@ -429,15 +483,80 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
         }
       }
       if (!this.transport || typeof this.transport.fetchFlags !== 'function') {
-        if (this.configSync && this.rulesStore) {
-          return this.evaluateFromRulesStore(mergedContext) as Record<string, T>;
-        }
         return this.flags as Record<string, T>;
       }
       return this.transport.fetchFlags(mergedContext, {
         persist: options?.persist === true,
       });
     });
+  }
+
+  /**
+   * Schedule SSE reconnect near lease `expiresAt` so an idle leader still renews
+   * (followers have no stream of their own under rules share).
+   *
+   * @param expiresAt Lease end from the last verified config-sync payload
+   */
+  private scheduleConfigSyncLeaseRenew(expiresAt: number): void {
+    if (this.leaseRenewTimer) {
+      clearTimeout(this.leaseRenewTimer);
+      this.leaseRenewTimer = null;
+    }
+    // Followers ask the leader via requestReconnect on the share transport.
+    if (this.shareHub?.currentRole === 'follower') return;
+    if (!Number.isFinite(expiresAt) || expiresAt <= 0) return;
+
+    const delayMs = Math.max(
+      0,
+      expiresAt - Date.now() - FlagClient.LEASE_RENEW_SKEW_MS,
+    );
+    this.leaseRenewTimer = setTimeout(() => {
+      this.leaseRenewTimer = null;
+      if (!this.transport?.requestReconnect) return;
+      if (this.leaseRenewInFlight) return;
+      this.leaseRenewInFlight = true;
+      logger.log(
+        '[FlagClient] Config-sync lease window ending — reconnecting for renew.',
+      );
+      this.transport.requestReconnect('lease_expired');
+    }, delayMs);
+  }
+
+  /**
+   * Follower hooks for rules-only share: hydrate rules locally and evaluate
+   * with this document's context (never the leader's).
+   */
+  private attachRulesShareFollower(): void {
+    if (!this.shareHub || !this.rulesStore) return;
+
+    this.shareHub.setFollowerRulesApply((payload) => {
+      this.rulesStore!.hydrateFromSnapshot(payload.snapshot);
+      this.leaseRenewInFlight = false;
+      if (payload.analytics) {
+        this.updateAnalytics(payload.analytics);
+      }
+      const flags = this.evaluateFromRulesStore() as Record<string, T>;
+      this.updateFlags(flags as FeatureFlags<T>, true);
+      return flags;
+    });
+
+    this.shareHub.setFollowerLocalEval((context) => {
+      return this.evaluateFromRulesStore(context) as Record<string, T>;
+    });
+  }
+
+  /**
+   * Leader: push the right snapshot type to followers after flags/rules change.
+   */
+  private broadcastShareSnapshot(): void {
+    if (!this.shareHub || this.shareHub.currentRole !== 'leader') return;
+    if (this.shareHub.shareMode === 'rules' && this.rulesStore) {
+      const snapshot = this.rulesStore.toSnapshot();
+      if (snapshot.flags.length === 0) return;
+      this.shareHub.broadcastRules(snapshot, this.analyticsMapFromRulesStore());
+      return;
+    }
+    this.shareHub.broadcastFlags(this.flags as Record<string, T>);
   }
 
   /**
@@ -598,9 +717,12 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
     this.flags = newFlags;
 
     // Server-eval: persist evaluated answers for offline bootstrap.
-    // Config-sync: never persist evaluated maps — they are context-specific and
-    // API-key keys are shared across same-origin tabs (last writer would win).
-    if (this.enableOfflineCache && !this.configSync) {
+    // Config-sync: adapter.saveFlags is already a no-op; also drop any leftover
+    // `*_flags` key (e.g. from an older SDK / server-eval session) so share +
+    // local eval never keep last-write-wins answers in storage.
+    if (this.configSync) {
+      syncCache.clearCachedFlags(this.apiKey);
+    } else if (this.enableOfflineCache) {
       void Promise.resolve(
         this.cacheAdapter.saveFlags(this.apiKey, newFlags)
       );
@@ -610,7 +732,7 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
     this.notifySubscribers();
 
     if (!fromShare) {
-      this.shareHub?.broadcastFlags(newFlags as Record<string, T>);
+      this.broadcastShareSnapshot();
     }
   }
 
@@ -835,6 +957,10 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
   destroy(): void {
     if (this.refreshIntervalId) {
       clearInterval(this.refreshIntervalId);
+    }
+    if (this.leaseRenewTimer) {
+      clearTimeout(this.leaseRenewTimer);
+      this.leaseRenewTimer = null;
     }
     if (this.evaluationReportTimer) {
       clearTimeout(this.evaluationReportTimer);
@@ -1191,6 +1317,7 @@ export class FlagClient<T = unknown, C extends Record<string, any> = Record<stri
     if (result.ok && (eventName === 'lease' || eventName === 'fullConfig')) {
       this.leaseRenewInFlight = false;
     }
+    this.scheduleConfigSyncLeaseRenew(store.getState().expiresAt);
     // Cold start: lease alone with empty rules — wait for fullConfig/deltas.
     if (
       eventName === 'lease' &&

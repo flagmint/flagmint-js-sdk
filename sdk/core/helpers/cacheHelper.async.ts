@@ -20,6 +20,13 @@ function getRulesKey(apiKey: string): string {
   return `flagmint_${apiKey}_rules`;
 }
 
+/**
+ * Parse a rules localCache JSON blob (async adapter).
+ * Keeps optional PII wire fields so offline hydrate can still hash context.
+ *
+ * @param raw JSON string from storage
+ * @returns Snapshot or null when the payload is unusable
+ */
 function parseRulesSnapshot(raw: string): RulesCacheSnapshot | null {
   try {
     const parsed = JSON.parse(raw) as RulesCacheSnapshot;
@@ -33,12 +40,27 @@ function parseRulesSnapshot(raw: string): RulesCacheSnapshot | null {
     ) {
       return null;
     }
-    return {
+    const snapshot: RulesCacheSnapshot = {
       version: parsed.version,
       expiresAt: parsed.expiresAt,
       flags: parsed.flags,
       segments: parsed.segments || {},
     };
+    if (Array.isArray(parsed.piiAttributes)) {
+      snapshot.piiAttributes = parsed.piiAttributes.filter(
+        (attr): attr is string => typeof attr === 'string',
+      );
+    }
+    if (typeof parsed.piiSalt === 'string') {
+      snapshot.piiSalt = parsed.piiSalt;
+    }
+    if (typeof parsed.piiValueEncoding === 'string') {
+      snapshot.piiValueEncoding = parsed.piiValueEncoding;
+    }
+    if (parsed.piiWireBroken === true) {
+      snapshot.piiWireBroken = true;
+    }
+    return snapshot;
   } catch {
     return null;
   }
@@ -67,6 +89,29 @@ export async function saveCachedFlags<T>(apiKey: string, data: FeatureFlags<T>):
   if (!storage) throw new Error('Async storage not set');
   try {
     await storage.setItem(getFlagsKey(apiKey), JSON.stringify({ ts: Date.now(), data }));
+  } catch {
+    // silent fail
+  }
+}
+
+/**
+ * Drop the evaluated-flag localCache entry for an API key (async adapter).
+ * Prefer `removeItem`; if the adapter omits it, overwrite with an immediately
+ * expired empty blob so {@link loadCachedFlags} returns null.
+ *
+ * @param apiKey SDK API key used as the storage key suffix
+ */
+export async function clearCachedFlags(apiKey: string): Promise<void> {
+  if (!storage) throw new Error('Async storage not set');
+  const key = getFlagsKey(apiKey);
+  try {
+    if (typeof storage.removeItem === 'function') {
+      await storage.removeItem(key);
+      return;
+    }
+    // Adapters may omit removeItem — still invalidate so a later server-eval
+    // session cannot revive last-write-wins answers until wall-clock TTL.
+    await storage.setItem(key, JSON.stringify({ ts: 0, data: {} }));
   } catch {
     // silent fail
   }

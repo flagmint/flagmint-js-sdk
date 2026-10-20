@@ -1,5 +1,10 @@
 import { FlagClient } from './client';
 import type { Transport } from './transports/Transport';
+import {
+  loadCachedFlags,
+  saveCachedFlags,
+  setCacheStorage,
+} from './helpers/cacheHelper';
 
 function createMockTransport() {
   const fetchFlagsCalls: Array<{
@@ -866,37 +871,51 @@ describe('FlagClient', () => {
     client.destroy();
   });
 
-  it('configSync does not load or save evaluated flag localCache', async () => {
-    const loadFlags = jest.fn(() => ({ wsd_internal_tester: false }));
-    const saveFlags = jest.fn();
-    const transport = createMockTransport();
+  it.each([false, true])(
+    'configSync + shareConnection %s deletes leftover *_flags and never rewrites it',
+    async (shareConnection) => {
+      const mem = memoryStorage();
+      setCacheStorage(mem);
+      const apiKey = `ff_config_no_eval_cache_${shareConnection}`;
+      // Stale last-write-wins entry from another tab / older SDK (agent19 answers).
+      saveCachedFlags(apiKey, { wsd_internal_tester: false });
+      expect(loadCachedFlags(apiKey, 60_000)).toEqual({ wsd_internal_tester: false });
 
-    const client = new FlagClient({
-      apiKey: 'ff_config_no_eval_cache',
-      context: { email: 'agent1@weseedo.nl' },
-      enableFlagmint: true,
-      deferInitialization: true,
-      shareConnection: false,
-      configSync: true,
-      enableOfflineCache: true,
-      transport,
-      cacheAdapter: {
-        loadFlags,
-        saveFlags,
-        loadContext: () => null,
-        saveContext: () => undefined,
-        loadRulesSnapshot: () => null,
-        saveRulesSnapshot: () => undefined,
-      },
-    });
+      const loadFlags = jest.fn(() => ({ wsd_internal_tester: false }));
+      const saveFlags = jest.fn();
+      const transport = createMockTransport();
 
-    await client.ready();
-    await client.updateContext({ email: 'agent1@weseedo.nl' });
+      const client = new FlagClient({
+        apiKey,
+        context: { kind: 'organization', key: 'wsd-app-anonymous' },
+        enableFlagmint: true,
+        deferInitialization: true,
+        shareConnection,
+        configSync: true,
+        enableOfflineCache: true,
+        transport,
+        ...(shareConnection
+          ? { share: shareHooks() }
+          : {}),
+        cacheAdapter: {
+          loadFlags,
+          saveFlags,
+          loadContext: () => null,
+          saveContext: () => undefined,
+          loadRulesSnapshot: () => null,
+          saveRulesSnapshot: () => undefined,
+        },
+      });
 
-    expect(loadFlags).not.toHaveBeenCalled();
-    expect(saveFlags).not.toHaveBeenCalled();
-    client.destroy();
-  });
+      await client.ready();
+      await client.updateContext({ email: 'agent1@weseedo.nl' });
+
+      expect(loadCachedFlags(apiKey, 60_000)).toBeNull();
+      expect(loadFlags).not.toHaveBeenCalled();
+      expect(saveFlags).not.toHaveBeenCalled();
+      client.destroy();
+    },
+  );
 
   it('keeps persist true on a local transport when persistContext is false', async () => {
     const transport = createMockTransport();
@@ -922,6 +941,117 @@ describe('FlagClient', () => {
     ]);
 
     client.destroy();
+  });
+
+  it('configSync share uses rules mode so follower context stays independent', async () => {
+    MemoryChannel.reset();
+    const share = shareHooks();
+    const apiKey = 'ff_config_sync_rules_share';
+    const snapshot = {
+      version: 3,
+      expiresAt: Date.now() + 60_000,
+      flags: [
+        {
+          key: 'wsd_internal_tester',
+          type: 'boolean' as const,
+          is_active: true,
+          default_value: false,
+          targeting_rules: [
+            {
+              id: 'r1',
+              kind: 'custom',
+              order_index: 0,
+              logical_op: 'AND',
+              conditions: [
+                {
+                  attribute: 'email',
+                  operator: 'eq',
+                  value: 'agent1@example.com',
+                },
+              ],
+              variation_id: 'on',
+            },
+          ],
+          variations: [
+            { id: 'on', value: true },
+            { id: 'off', value: false },
+          ],
+          rollouts: {},
+          analytics_enabled: false,
+        },
+      ],
+      segments: {},
+    };
+    const noCache = {
+      loadFlags: () => null,
+      saveFlags: () => undefined,
+      loadContext: () => null,
+      saveContext: () => undefined,
+      loadRulesSnapshot: () => null,
+      saveRulesSnapshot: () => undefined,
+    };
+
+    const leader = new FlagClient({
+      apiKey,
+      context: { email: 'agent1@example.com' },
+      enableFlagmint: true,
+      deferInitialization: true,
+      configSync: true,
+      shareConnection: true,
+      share,
+      enableOfflineCache: false,
+      cacheAdapter: noCache,
+      transport: createMockTransport(),
+    });
+    await leader.ready();
+
+    const leaderPriv = leader as unknown as {
+      shareHub: {
+        currentRole: string;
+        shareMode: string;
+        broadcastRules: (s: typeof snapshot) => void;
+      };
+      rulesStore: { hydrateFromSnapshot: (s: typeof snapshot) => void };
+      evaluateFromRulesStore: () => Record<string, unknown>;
+      updateFlags: (f: Record<string, unknown>, fromShare?: boolean) => void;
+    };
+    expect(leaderPriv.shareHub.currentRole).toBe('leader');
+    expect(leaderPriv.shareHub.shareMode).toBe('rules');
+    leaderPriv.rulesStore.hydrateFromSnapshot(snapshot);
+    leaderPriv.updateFlags(leaderPriv.evaluateFromRulesStore());
+    expect(leader.getFlag('wsd_internal_tester', false)).toBe(true);
+
+    const follower = new FlagClient({
+      apiKey,
+      context: { email: 'agent19@example.com' },
+      enableFlagmint: true,
+      deferInitialization: true,
+      configSync: true,
+      shareConnection: true,
+      share,
+      enableOfflineCache: false,
+      cacheAdapter: noCache,
+    });
+    await follower.ready();
+
+    const followerPriv = follower as unknown as {
+      shareHub: { currentRole: string; shareMode: string };
+    };
+    expect(followerPriv.shareHub.currentRole).toBe('follower');
+    expect(followerPriv.shareHub.shareMode).toBe('rules');
+    expect(follower.getFlag('wsd_internal_tester', false)).toBe(false);
+
+    await follower.updateContext({ email: 'agent1@example.com' });
+    expect(follower.getFlag('wsd_internal_tester', false)).toBe(true);
+    expect(leader.getFlag('wsd_internal_tester', false)).toBe(true);
+
+    await follower.updateContext({ email: 'agent19@example.com' });
+    expect(follower.getFlag('wsd_internal_tester', false)).toBe(false);
+    expect(leader.getFlag('wsd_internal_tester', false)).toBe(true);
+
+    follower.destroy();
+    leader.destroy();
+    MemoryChannel.reset();
   });
 
   describe('shared leader and follower persistContext', () => {

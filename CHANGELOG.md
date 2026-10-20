@@ -6,18 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
-## [2.2.3-rc.2] — 2026-10-18
+## [2.2.3] — 2026-10-18
 
 ### Fixed
 
-- **Rules localCache PII fields.** `loadCachedRulesSnapshot` / `parseRulesSnapshot` no longer strip `piiAttributes`, `piiSalt`, `piiValueEncoding`, or `piiWireBroken`. Hydrate → re-persist was rewriting storage without PII, so email targeting failed after reload until a fresh `fullConfig`.
+- **Local evaluation after reload.** Rules cached in the browser no longer lose PII metadata (`piiAttributes`, `piiSalt`, encoding, fail-closed flag). Email / other hashed targeting keeps working after a refresh instead of waiting for a fresh full config download.
 
-> npm: `npm install flagmint-js-sdk@2.2.3-rc.2` (dist-tag `rc`).  
-> Note: `2.2.3-rc.1` was staged on npm but never became installable (E409); use `rc.2`.
+- **Cross-tab flag answers under config sync.** With local evaluation on, the SDK no longer stores evaluated flag values under a shared API-key key (so one tab’s answers cannot overwrite another’s). Only the signed rules snapshot is cached; each tab evaluates with its own context.
+
+### Added
+
+- **Rules-only connection sharing.** With `configSync` and `shareConnection` enabled, same-origin tabs elect one stream leader and share verified rules. Followers evaluate locally with their own context. Server-evaluation sharing (config sync off) is unchanged.
+
+- **Smarter lease renewals for shared rules.** Followers asking to reconnect tell the leader to renew; the leader also reconnects shortly before the lease expires so followers stay warm when the server only issues leases on connect.
+
 
 ## [2.2.3-rc.1] — 2026-10-18
 
-Yanked / not installable (npm staged conflict). Same fix as `2.2.3-rc.2`.
+Yanked / not installable (npm staged conflict). Included the config-sync offline-cache fix from `2.2.3-rc.0`.
+
+## [2.2.3-rc-2] — 2026-10-18
+
+### Fixed
+
+- Rules-only connection sharing for config sync (#24) and rules localCache PII fields (see `[2.2.3]` above).
+
+### Known issue
+
+- **Regressed** the config-sync offline-cache fix from `2.2.3-rc.0`: still load/save `flagmint_<apiKey>_flags` under `configSync`, so same-origin tabs last-write-wins. Fixed again in source for the next `2.2.3` publish (clear on init + never persist evaluated maps when `configSync` is on).
 
 ## [2.2.3-rc.0] — 2026-10-18
 

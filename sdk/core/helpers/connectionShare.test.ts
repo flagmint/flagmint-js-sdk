@@ -130,6 +130,83 @@ describe('ConnectionShareHub', () => {
     follower.destroy();
   });
 
+  it('in rules mode follower, requestReconnect asks the leader to renew the lease', async () => {
+    const options = { ...shareOptions(), mode: 'rules' as const };
+    const leader = new ConnectionShareHub('ff_rules_renew', options);
+    const follower = new ConnectionShareHub('ff_rules_renew', options);
+
+    await leader.join();
+    const renew = jest.fn();
+    leader.setLeaderLeaseRenewHandler(renew);
+
+    await follower.join();
+    const transport = follower.createFollowerTransport();
+    transport.requestReconnect?.('lease_expired');
+
+    expect(renew).toHaveBeenCalledTimes(1);
+
+    leader.destroy();
+    follower.destroy();
+  });
+
+  it('in rules mode, share snapshots without forwarding follower context', async () => {
+    const options = { ...shareOptions(), mode: 'rules' as const };
+    const leader = new ConnectionShareHub('ff_rules', options);
+    const follower = new ConnectionShareHub('ff_rules', options);
+
+    await leader.join();
+    const snapshot = {
+      version: 1,
+      expiresAt: Date.now() + 60_000,
+      flags: [
+        {
+          key: 'demo',
+          type: 'boolean' as const,
+          is_active: true,
+          default_value: false,
+          targeting_rules: [],
+          variations: [{ id: 'on', value: true }],
+          rollouts: {},
+          analytics_enabled: false,
+        },
+      ],
+      segments: {},
+    };
+    leader.broadcastRules(snapshot);
+
+    let appliedEmail = '';
+    follower.setFollowerRulesApply(() => {
+      appliedEmail = 'from-rules';
+      return { demo: true };
+    });
+    follower.setFollowerLocalEval((context) => ({
+      demo: (context as { email?: string }).email === 'agent1@example.com',
+    }));
+
+    await follower.join();
+    const transport = follower.createFollowerTransport();
+    const received: Array<Record<string, unknown>> = [];
+    transport.onFlagsUpdated?.((flags) => received.push(flags));
+    await transport.init();
+
+    expect(appliedEmail).toBe('from-rules');
+    expect(received).toEqual([{ demo: true }]);
+
+    const contextHandler = jest.fn(async () => ({ demo: false }));
+    leader.setLeaderContextHandler(contextHandler);
+
+    await expect(
+      transport.fetchFlags({ email: 'agent1@example.com' }),
+    ).resolves.toEqual({ demo: true });
+    await expect(
+      transport.fetchFlags({ email: 'agent19@example.com' }),
+    ).resolves.toEqual({ demo: false });
+    expect(contextHandler).not.toHaveBeenCalled();
+
+    leader.destroy();
+    follower.destroy();
+  });
+
   it('forwards follower context updates through the leader', async () => {
     const options = shareOptions();
     const leader = new ConnectionShareHub('ff_test', options);
