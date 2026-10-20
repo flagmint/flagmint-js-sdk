@@ -333,7 +333,7 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
   }
 
   /**
-   * Leader-only: publish the current evaluated flags to all followers.
+   * Leader-only (non-rules mode): publish the current evaluated flags to all followers.
    * No-op on followers (avoids echo loops). Evaluated mode only.
    *
    * @param flags Evaluated flag map from the leader stream
@@ -488,9 +488,19 @@ export class ConnectionShareHub<C = Record<string, unknown>, T = unknown> {
   }
 
   /**
-   * JSON-clone then post. Native `BroadcastChannel` structured-clones the
-   * payload; Vue reactive Proxies and similar host objects throw
-   * `DataCloneError`. JSON.stringify can walk those Proxies.
+   * Post a share-hub message after forcing a plain JSON clone.
+   *
+   * `BroadcastChannel.postMessage` uses the structured-clone algorithm. That
+   * rejects Vue reactive Proxies (and similar host objects) with
+   * `DataCloneError`, which would break multi-tab share when the app passes
+   * a reactive context or flag map.
+   *
+   * We run {@link toJsonCloneable} first: `JSON.stringify` can walk those
+   * Proxies into a plain object tree that structured clone accepts. If the
+   * value still cannot be serialized (functions, DOM nodes, cycles), we throw
+   * `ERR_CONTEXT_NOT_CLONEABLE` instead of a bare `DataCloneError`.
+   *
+   * @param message Share protocol payload (flags, rules, context RPC, etc.)
    */
   private post(message: ShareMessage<C, T>): void {
     if (!this.channel) return;

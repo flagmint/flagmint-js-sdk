@@ -130,7 +130,7 @@ describe('ConnectionShareHub', () => {
     follower.destroy();
   });
 
-  it('rules mode follower requestReconnect asks the leader to renew the lease', async () => {
+  it('in rules mode follower, requestReconnect asks the leader to renew the lease', async () => {
     const options = { ...shareOptions(), mode: 'rules' as const };
     const leader = new ConnectionShareHub('ff_rules_renew', options);
     const follower = new ConnectionShareHub('ff_rules_renew', options);
@@ -149,7 +149,7 @@ describe('ConnectionShareHub', () => {
     follower.destroy();
   });
 
-  it('rules mode shares snapshots without forwarding follower context', async () => {
+  it('in rules mode, share snapshots without forwarding follower context', async () => {
     const options = { ...shareOptions(), mode: 'rules' as const };
     const leader = new ConnectionShareHub('ff_rules', options);
     const follower = new ConnectionShareHub('ff_rules', options);
